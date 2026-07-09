@@ -367,35 +367,85 @@ def session_kind(entries) -> dict:
     }
 
 
+def own_session_id(entries) -> str:
+    """The dominant sessionId in a transcript.
+
+    A file should describe exactly one session, but resumed or compacted
+    transcripts can carry stray entries. The modal sessionId is the true owner.
+    """
+    counts = {}
+    for e in entries:
+        sid = e.get("sessionId")
+        if sid:
+            counts[sid] = counts.get(sid, 0) + 1
+    if not counts:
+        return ""
+    return max(counts.items(), key=lambda kv: kv[1])[0]
+
+
+def foreign_session_ids(entries) -> set:
+    """sessionIds present in the file that are not its owner."""
+    own = own_session_id(entries)
+    return {e.get("sessionId") for e in entries
+            if e.get("sessionId") and e.get("sessionId") != own}
+
+
 def infer_description(entries, max_len=140) -> str:
-    """Best-effort one-line description of a session.
+    return _infer_description(entries, max_len)[0]
+
+
+def _infer_description(entries, max_len=140):
+    """Best-effort one-line description. Returns (description, source_rung).
 
     Preference order (each falls through to the next):
       1. An explicit `summary` entry (Claude Code writes these).
       2. The first real top-level user prompt.
       3. A spawning `Task` tool call's description/prompt  -- subagent sessions.
-      4. The first sidechain user turn  -- i.e. the agent's own instructions.
+      4. The first sidechain user turn -- i.e. the agent's own instructions.
       5. The first assistant prose.
       6. Empty string (caller supplies a fallback label).
 
     Steps 3-5 exist because subagent transcripts have no top-level prompt and
     would otherwise be indexed as "(no description)".
+
+    Two guards stop a neighbouring conversation's text from bleeding in:
+      * a `summary` is trusted only if it has no leafUuid, or its leafUuid names
+        an entry this transcript actually contains;
+      * prompts are read only from entries belonging to the file's own session.
     """
-    # 1. explicit summary
+    own_uuids = {e["uuid"] for e in entries if e.get("uuid")}
+    own_sid = own_session_id(entries)
+
+    def mine(e):
+        sid = e.get("sessionId")
+        return (not sid) or (not own_sid) or sid == own_sid
+
+    def clip(t):
+        return _clip(re.sub(r"\s+", " ", t), max_len)
+
+    # 1. explicit summary -- only if it describes THIS transcript
     for e in entries:
-        if e.get("type") == "summary" and e.get("summary"):
-            return _clip(str(e["summary"]), max_len)
+        if e.get("type") != "summary" or not e.get("summary"):
+            continue
+        leaf = e.get("leafUuid")
+        if leaf and own_uuids and leaf not in own_uuids:
+            continue  # a summary of some other conversation
+        return _clip(str(e["summary"]), max_len), "summary"
 
     # 2. first mainline user prompt
     for e in entries:
         if e.get("type") != "user" or e.get("isMeta") or e.get("isSidechain"):
             continue
+        if not mine(e):
+            continue
         text = _msg_text(e)
         if _usable(text):
-            return _clip(re.sub(r"\s+", " ", text), max_len)
+            return clip(text), "user-prompt"
 
     # 3. the Task tool call that spawned an agent
     for e in entries:
+        if not mine(e):
+            continue
         msg = e.get("message") or {}
         content = msg.get("content")
         if not isinstance(content, list):
@@ -405,23 +455,23 @@ def infer_description(entries, max_len=140) -> str:
                 inp = b.get("input") or {}
                 cand = inp.get("description") or inp.get("prompt") or ""
                 if cand.strip():
-                    return _clip(re.sub(r"\s+", " ", cand), max_len)
+                    return clip(cand), "task-call"
 
-    # 4. first sidechain user turn = the agent's instructions
+    # 4. first sidechain user turn = the agent's own instructions
     for e in entries:
         if e.get("type") == "user" and e.get("isSidechain") and not e.get("isMeta"):
             text = _msg_text(e)
             if _usable(text):
-                return _clip(re.sub(r"\s+", " ", text), max_len)
+                return clip(text), "sidechain-prompt"
 
     # 5. first assistant prose
     for e in entries:
-        if e.get("type") == "assistant":
+        if e.get("type") == "assistant" and mine(e):
             text = _msg_text(e)
             if _usable(text):
-                return _clip(re.sub(r"\s+", " ", text), max_len)
+                return clip(text), "assistant-prose"
 
-    return ""
+    return "", "none"
 
 
 def _clip(s: str, n: int) -> str:
@@ -456,8 +506,9 @@ def extract_meta(entries, path=None) -> dict:
                     tool_calls += 1
 
     kind = session_kind(entries)
-    sid = session_id or (path.stem if path else "unknown")
-    desc = infer_description(entries)
+    # Trust the transcript's own sessionId over the filename.
+    sid = own_session_id(entries) or session_id or (path.stem if path else "unknown")
+    desc, desc_src = _infer_description(entries)
     if not desc:
         # Never emit a bare "(no description)" -- say something useful.
         label = "Subagent run" if kind["is_subagent"] else "Session"
@@ -465,6 +516,8 @@ def extract_meta(entries, path=None) -> dict:
 
     return {
         "session_id": sid,
+        "description_source": desc_src,
+        "foreign_sessions": sorted(foreign_session_ids(entries)),
         "cwd": cwd or "",
         "project": os.path.basename(cwd) if cwd else "",
         "version": version or "",

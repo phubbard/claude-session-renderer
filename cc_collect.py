@@ -39,6 +39,7 @@ Config:
 import argparse
 import concurrent.futures as cf
 import datetime as _dt
+import hashlib
 import html
 import json
 import os
@@ -229,6 +230,71 @@ def fetch_host(name: str, target: str, staging: Path, verbose=True):
 # --------------------------------------------------------------------------- #
 # Step 2 + 3: render + index
 # --------------------------------------------------------------------------- #
+def plausible_host(cwd: str, osname: str) -> bool:
+    """Could a transcript with this cwd have been recorded on this OS?
+
+    macOS homes live under /Users; Linux under /home, /root, /srv, /opt, /var.
+    A Linux path attributed to a Darwin host means the transcript was collected
+    from somewhere else -- usually a shared or synced ~/.claude, or a stale
+    staging directory. Cheap check, catches a genuinely confusing failure.
+    """
+    if not cwd or not osname:
+        return True
+    if osname == "Darwin":
+        return not cwd.startswith(("/home/", "/srv/", "/root/"))
+    if osname == "Linux":
+        return not cwd.startswith("/Users/")
+    return True
+
+
+def dedupe_records(records, keep_duplicates=False):
+    """Collapse the same session appearing on more than one host.
+
+    A session id is globally unique, so the same id on two machines means one
+    transcript reachable from both (shared home, rsync, restored backup) -- not
+    two sessions. Rendering it once per host is wrong and was showing projects
+    twice in the index.
+
+    Byte-identical copies collapse to a single primary record; the other hosts
+    are recorded in `also_on`. Same id with *different* content is a real
+    conflict: keep both and say so.
+
+    Primary host preference: one whose platform is consistent with the
+    transcript's cwd, then the one with more turns, then alphabetical -- so the
+    result is deterministic across runs.
+    """
+    by_id = {}
+    for r in records:
+        by_id.setdefault(r["session_id"], []).append(r)
+
+    kept, dupes, conflicts = [], 0, []
+    for sid, group in by_id.items():
+        if len(group) == 1 or keep_duplicates:
+            kept.extend(group)
+            continue
+
+        hashes = {r["content_hash"] for r in group}
+        if len(hashes) > 1:
+            # Same id, different bytes. Don't silently pick one.
+            conflicts.append((sid, sorted(r["host"] for r in group)))
+            for r in group:
+                r["conflict"] = True
+            kept.extend(group)
+            continue
+
+        primary = sorted(group, key=lambda r: (
+            not plausible_host(r["cwd"], r["os"]),   # plausible first
+            -r["turns"],                             # then richer
+            r["host"],                               # then stable
+        ))[0]
+        primary["also_on"] = sorted(r["host"] for r in group if r is not primary)
+        dupes += len(group) - 1
+        kept.append(primary)
+
+    kept.sort(key=lambda r: r["first_ts"] or "", reverse=True)
+    return kept, {"removed": dupes, "conflicts": conflicts}
+
+
 def _uuid_graph(entries):
     """Return (own_uuids, external_parent_uuid).
 
@@ -248,23 +314,24 @@ def _uuid_graph(entries):
 
 
 def render_all(host_data, site: Path, include_thinking=True, do_redact=True,
-               skip_subagents=False):
+               skip_subagents=False, keep_duplicates=False):
     """host_data: {name: (platform, [paths])}.
 
-    Returns (records, total Counter, uuid_index) where uuid_index maps
+    Returns (records, Counter, uuid_index, stats). uuid_index maps
     (host, uuid) -> session_id so subagents can be reattached to their parent.
+
+    Deduplication happens before rendering, so a session reachable from two
+    machines produces one page, not two.
     """
     from collections import Counter
-    records = []
     grand = Counter()
     uuid_index = {}
-    pending = []  # (meta, entries, note, n_red, plat, name, path)
+    pending = []  # (meta, entries, note, plat, name, path)
 
     for name, (plat, paths) in host_data.items():
-        outdir = site / name
-        outdir.mkdir(parents=True, exist_ok=True)
         for p in paths:
             p = Path(p)
+            raw = p.read_bytes()
             entries = load_jsonl(p)
             if not entries:
                 continue
@@ -285,31 +352,45 @@ def render_all(host_data, site: Path, include_thinking=True, do_redact=True,
             own, external = _uuid_graph(entries)
             for u in own:
                 uuid_index[(name, u)] = meta["session_id"]
-            meta["parent_uuid"] = external
 
-            pending.append((meta, entries, note, n_red, plat, name, p))
+            meta.update({
+                "parent_uuid": external,
+                "host": name,
+                "platform": plat.get("pretty", "?"),
+                "os": plat.get("os", "?"),
+                "arch": plat.get("arch", ""),
+                "redactions": n_red,
+                "content_hash": hashlib.sha256(raw).hexdigest(),
+                "also_on": [],
+                "conflict": False,
+            })
+            pending.append((meta, entries, note, name, p))
 
-    # Render after the uuid index is complete, so nothing depends on file order.
-    for meta, entries, note, n_red, plat, name, p in pending:
+    metas = [m for m, *_ in pending]
+    kept, dstats = dedupe_records(metas, keep_duplicates=keep_duplicates)
+    keep_ids = {id(m) for m in kept}
+
+    mismatched = [m for m in kept if not plausible_host(m["cwd"], m["os"])]
+
+    # Render after dedupe and after the uuid index is complete, so nothing
+    # depends on file iteration order.
+    records = []
+    for meta, entries, note, name, p in pending:
+        if id(meta) not in keep_ids:
+            continue
+        (site / name).mkdir(parents=True, exist_ok=True)
         doc = build_html(entries, meta["description"], f"{name}:{p.name}",
                          include_thinking=include_thinking,
                          redaction_note=note, redacted=do_redact)
         rel = f"{name}/{meta['session_id']}.html"
         (site / rel).write_text(doc, encoding="utf-8")
-        meta.update({
-            "host": name,
-            "platform": plat.get("pretty", "?"),
-            "os": plat.get("os", "?"),
-            "arch": plat.get("arch", ""),
-            "href": rel,
-            "bytes": (site / rel).stat().st_size,
-            "redactions": n_red,
-        })
+        meta["href"] = rel
+        meta["bytes"] = (site / rel).stat().st_size
         records.append(meta)
 
-    # Newest first, by session start.
     records.sort(key=lambda r: r["first_ts"] or "", reverse=True)
-    return records, grand, uuid_index
+    dstats["mismatched"] = mismatched
+    return records, grand, uuid_index, dstats
 
 
 def link_subagents(records, uuid_index):
@@ -422,6 +503,8 @@ letter-spacing:.02em;color:#fff;}
 .agent-badge{background:transparent;border:1px solid var(--agent);color:var(--agent);}
 .redact-badge{background:transparent;border:1px solid #b3453a;color:#b3453a;}
 .link-inferred{border:1px dashed var(--muted);color:var(--muted);background:transparent;}
+.also-on{background:transparent;border:1px solid var(--muted);color:var(--muted);}
+.conflict-badge{background:#b3453a;color:#fff;}
 .orphan-head{color:var(--muted);}
 .os-Linux{border:1px solid #d9772e;color:#d9772e;background:transparent;}
 .os-Darwin{border:1px solid #6b6a66;color:var(--muted);background:transparent;}
@@ -443,6 +526,18 @@ def _facts(r, compact=False):
     bits = [f'<span class="badge {_host_cls(r["host"])}">{esc(r["host"])}</span>']
     if not compact:
         bits.append(f'<span class="badge os-{esc(r["os"])}">{esc(r["platform"])}</span>')
+
+    if r.get("also_on"):
+        others = ", ".join(r["also_on"])
+        bits.append(f'<span class="badge also-on" title="Identical transcript also on: '
+                    f'{esc(others)}">also on {esc(others)}</span>')
+    if r.get("conflict"):
+        bits.append('<span class="badge conflict-badge" title="Same session id but '
+                    'different content on another host">id conflict</span>')
+    if not plausible_host(r.get("cwd", ""), r.get("os", "")):
+        bits.append(f'<span class="badge conflict-badge" title="This working directory '
+                    f'cannot exist on a {esc(r.get("os",""))} host; the host label is '
+                    f'probably wrong">host mismatch</span>')
 
     if r.get("is_subagent"):
         at = f' {esc(r["agent_type"])}' if r.get("agent_type") else ""
@@ -717,6 +812,10 @@ def main(argv=None):
     ap.add_argument("--no-thinking", action="store_true", help="Omit thinking blocks")
     ap.add_argument("--skip-subagents", action="store_true",
                     help="Don't render subagent runs at all; omit them from the index")
+    ap.add_argument("--keep-duplicates", action="store_true",
+                    help="Don't collapse a session found on more than one host")
+    ap.add_argument("--explain", action="store_true",
+                    help="Print where each session's description came from, then exit")
     ap.add_argument("--no-redact", action="store_true",
                     help="DANGEROUS: publish raw transcripts without scrubbing credentials")
     ap.add_argument("--jobs", type=int, default=4, help="Parallel host fetches")
@@ -807,14 +906,40 @@ def main(argv=None):
           f"{'' if not args.no_redact else '  (REDACTION DISABLED)'}")
     clean_dir(site)
     site.mkdir(parents=True, exist_ok=True)
-    records, grand, uuid_index = render_all(host_data, site,
-                                            include_thinking=not args.no_thinking,
-                                            do_redact=not args.no_redact,
-                                            skip_subagents=args.skip_subagents)
+    records, grand, uuid_index, dstats = render_all(
+        host_data, site,
+        include_thinking=not args.no_thinking,
+        do_redact=not args.no_redact,
+        skip_subagents=args.skip_subagents,
+        keep_duplicates=args.keep_duplicates)
     n_main = sum(1 for r in records if not r["is_subagent"])
     n_agents = len(records) - n_main
     print(f"  rendered {n_main} sessions"
           + (f" + {n_agents} subagent runs" if n_agents else ""))
+
+    if dstats["removed"]:
+        print(f"  deduped {dstats['removed']} transcript(s) reachable from more "
+              f"than one host")
+    for sid, hosts in dstats["conflicts"]:
+        print(f"  WARNING: session {sid[:8]} differs between {', '.join(hosts)}; "
+              f"keeping both", file=sys.stderr)
+    if dstats["mismatched"]:
+        print(f"  WARNING: {len(dstats['mismatched'])} transcript(s) have a working "
+              f"directory that can't exist on the host they came from:", file=sys.stderr)
+        for m in dstats["mismatched"][:5]:
+            print(f"    {m['session_id'][:8]}  host={m['host']} ({m['os']})  "
+                  f"cwd={m['cwd']}", file=sys.stderr)
+        print("    -> a shared/synced ~/.claude, or a stale --staging dir. "
+              "Check before trusting the host labels.", file=sys.stderr)
+
+    if args.explain:
+        print("\nDescription provenance:")
+        for r in sorted(records, key=lambda r: (r["host"], r["first_ts"] or "")):
+            foreign = f"  foreign-sessions={len(r['foreign_sessions'])}" if r["foreign_sessions"] else ""
+            print(f"  {r['session_id'][:8]}  {r['host']:8} "
+                  f"{r['description_source']:16} {r['description'][:52]!r}{foreign}")
+        return 0
+
     if not args.no_redact:
         s = summarize(grand)
         print(f"  redaction: {s or 'no known secret patterns found'}")

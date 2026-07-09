@@ -140,6 +140,57 @@ The `Subagents:` selector switches between collapsed (default), expanded, and hi
 
 Searching matches subagents too, and auto-expands any parent whose child matched.
 
+## Sessions on more than one machine
+
+A session id is globally unique, so the same id appearing on two hosts means **one
+transcript reachable from both** — a shared or synced `~/.claude`, an rsync'd home, a
+restored backup — not two sessions. Rendering it once per host duplicated whole projects
+in the index.
+
+Transcripts are deduplicated by session id plus a SHA-256 of the file. Byte-identical
+copies collapse to a single row tagged `also on <host>`. Same id with *different* bytes is
+a real conflict: both are kept, both are badged `id conflict`, and the build warns.
+
+The surviving host is chosen deterministically: one whose platform is consistent with the
+transcript's working directory, then the one with more turns, then alphabetically.
+
+`--keep-duplicates` restores the old per-host behaviour.
+
+### Host mismatch warnings
+
+macOS homes live under `/Users`; Linux under `/home`, `/srv`, `/root`. A transcript whose
+cwd can't exist on the OS it was collected from is flagged `host mismatch` in the index and
+warned about at build time:
+
+```
+WARNING: 1 transcript(s) have a working directory that can't exist on the host they came from:
+  0a7bdc40  host=laptop (Darwin)  cwd=/home/pfh/code/debrid-media-manager
+  -> a shared/synced ~/.claude, or a stale --staging dir.
+```
+
+Usually this means a stale `--staging` directory, or a home directory shared between
+machines. The host labels are not to be trusted until it's resolved.
+
+## Where a description came from
+
+`--explain` prints the provenance of every description and exits:
+
+```
+$ python3 cc_collect.py --explain
+9508ab88  laptop   user-prompt      'I have a USB footswitch. I want to create a mac app'
+0a7bdc40  web      user-prompt      'I have a USB footswitch. I want to create a mac app'
+178f6f91  web      user-prompt      'I want to modify this repo. Immediate questions:...'
+```
+
+Useful when a description looks like it belongs to a different conversation. Two sessions
+can legitimately share text — e.g. you paste a prompt in the wrong repo, get one reply,
+quit, and start again in the right one. `--explain` tells you whether the text came from
+the transcript's own prompt (`user-prompt`) or from something inherited.
+
+Two guards keep a neighbouring conversation's text from bleeding in: a `summary` entry is
+trusted only if its `leafUuid` names an entry the transcript actually contains, and prompts
+are read only from entries whose `sessionId` matches the file's own.
+
 ## Subagent sessions
 
 Claude Code marks subagent turns with `isSidechain`. A transcript whose only user turns
@@ -189,6 +240,8 @@ Pages set `noindex`, but auth is what actually keeps them private.
 | `--no-fetch` | Rebuild from an existing `--staging` dir; no SSH |
 | `--no-thinking` | Omit Claude's thinking blocks |
 | `--skip-subagents` | Don't render subagent runs at all |
+| `--keep-duplicates` | Don't collapse a session found on several hosts |
+| `--explain` | Print each description's provenance, then exit |
 | `--no-redact` | Publish raw. Warns loudly. Don't. |
 | `--staging DIR` | Keep fetched JSONL around |
 | `--deploy-to H:P` | scp destination; overrides the `deploy` line in `hosts.conf` |
