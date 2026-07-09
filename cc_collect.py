@@ -8,7 +8,7 @@ Pipeline:
     2. render   Render every session to a self-contained HTML page (via publish_session.py)
     3. index    Build index.html ordered by date, with inferred descriptions
                 and machine/platform annotations
-    4. deploy   scp the whole tree to web:sessions/
+    4. deploy   scp the whole tree to the configured target
 
 Requires: ssh + scp on this machine, and working key-based auth to each host.
 Run it from wherever your SSH agent lives (your laptop), NOT from a sandbox.
@@ -16,17 +16,24 @@ Run it from wherever your SSH agent lives (your laptop), NOT from a sandbox.
 Quick start:
     python3 cc_collect.py --dry-run           # show what would happen
     python3 cc_collect.py --no-deploy         # build locally into ./_site
-    python3 cc_collect.py                     # full run + scp to web:sessions/
+    python3 cc_collect.py                     # full run + scp to the deploy target
 
 Config:
-    Hosts come from hosts.conf (see --hosts-file), one entry per line:
+    Everything lives in hosts.conf (see --hosts-file). It is gitignored, so real
+    hostnames stay out of the repo.
 
         # name        ssh-target              (use "local" for this machine)
         web           you@web.example.com
         axiom         you@axiom.example.com
         laptop        local
 
-    Blank lines and #-comments ignored. Override with repeated --host name=target.
+        # where to publish the built site
+        deploy        web.example.com:sessions
+
+    Blank lines and #-comments ignored. Override hosts with repeated
+    --host name=target, and the deploy target with --deploy-to HOST:PATH.
+    There is no built-in deploy default: if none is configured, the run stops
+    rather than scp'ing somewhere you didn't intend.
 """
 
 import argparse
@@ -64,17 +71,38 @@ SSH_OPTS = [
 # Config
 # --------------------------------------------------------------------------- #
 def parse_hosts_file(path: Path):
+    """Parse hosts.conf. Returns (hosts, deploy_target).
+
+    Two line forms:
+        <name> <ssh-target>       a machine to collect transcripts from
+        deploy <host[:path]>      where to scp the built site  (at most one)
+
+    "deploy" is a reserved first word, so a machine cannot be named "deploy".
+    Anything after # is a comment.
+
+    The deploy target lives here, not in this file, because hosts.conf is
+    gitignored -- your real hostname never reaches the public repo.
+    """
     hosts = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.split("#", 1)[0].strip()
+    deploy_target = ""
+    for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
         if not line:
             continue
         parts = line.split()
+        if parts[0].lower() == "deploy":
+            if len(parts) < 2:
+                sys.exit(f"{path}:{lineno}: 'deploy' needs a target, e.g.\n"
+                         f"    deploy web.example.com:sessions")
+            if deploy_target:
+                sys.exit(f"{path}:{lineno}: more than one 'deploy' line")
+            deploy_target = parts[1]
+            continue
         if len(parts) == 1:
             hosts.append((parts[0], parts[0]))
         else:
             hosts.append((parts[0], parts[1]))
-    return hosts
+    return hosts, deploy_target
 
 
 # --------------------------------------------------------------------------- #
@@ -459,8 +487,8 @@ def main(argv=None):
     ap.add_argument("--site", type=Path, default=Path("_site"), help="Local build dir")
     ap.add_argument("--staging", type=Path, default=None,
                     help="Where fetched .jsonl land (default: temp dir)")
-    ap.add_argument("--deploy-to", default="web.example.com:sessions",
-                    help="scp destination (default: web.example.com:sessions)")
+    ap.add_argument("--deploy-to", default=None,
+                    help="scp destination, overriding the 'deploy' line in hosts.conf")
     ap.add_argument("--no-fetch", action="store_true",
                     help="Reuse an existing --staging dir instead of SSHing")
     ap.add_argument("--no-deploy", action="store_true", help="Build locally, don't scp")
@@ -476,10 +504,10 @@ def main(argv=None):
               "         machine will be published. Ctrl-C now if that isn't intended.",
               file=sys.stderr)
 
-    # Resolve host list.
-    hosts = []
+    # Resolve host list + deploy target.
+    hosts, cfg_deploy = [], ""
     if args.hosts_file.exists():
-        hosts = parse_hosts_file(args.hosts_file)
+        hosts, cfg_deploy = parse_hosts_file(args.hosts_file)
     elif not args.host:
         hosts = DEFAULT_HOSTS
         print(f"note: {args.hosts_file} not found; using defaults "
@@ -489,6 +517,16 @@ def main(argv=None):
     hosts += list(overrides.items())
     if not hosts:
         sys.exit("error: no hosts configured")
+
+    # CLI beats hosts.conf. No silent fallback to a placeholder hostname.
+    deploy_target = args.deploy_to or cfg_deploy
+    if not deploy_target and not (args.no_deploy or args.dry_run):
+        sys.exit(
+            "error: no deploy target configured.\n"
+            f"  Add a line to {args.hosts_file}:\n"
+            "      deploy web.example.com:sessions\n"
+            "  or pass --deploy-to HOST:PATH, or build locally with --no-deploy."
+        )
 
     staging = args.staging or Path(tempfile.mkdtemp(prefix="cc-staging-"))
     staging.mkdir(parents=True, exist_ok=True)
@@ -519,8 +557,13 @@ def main(argv=None):
                 else:
                     print(f"  [{name}] would ssh {target}, then "
                           f"scp {target}:{REMOTE_GLOB}/**/*.jsonl")
-            print(f"  would render → {args.site}, then "
-                  f"{'skip deploy' if args.no_deploy else f'scp → {args.deploy_to}/'}")
+            if args.no_deploy:
+                tail = "skip deploy"
+            elif deploy_target:
+                tail = f"scp → {deploy_target}/"
+            else:
+                tail = "NO DEPLOY TARGET (add a 'deploy' line to hosts.conf)"
+            print(f"  would render → {args.site}, then {tail}")
             return 0
         with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
             futs = {ex.submit(fetch_host, n, t, staging): n for n, t in hosts}
@@ -562,7 +605,7 @@ def main(argv=None):
     if args.no_deploy:
         print(f"  skipped (--no-deploy). Built tree: {site.resolve()}")
     else:
-        ok = deploy(site, args.deploy_to, dry_run=args.dry_run)
+        ok = deploy(site, deploy_target, dry_run=args.dry_run)
         if not ok:
             return 1
 

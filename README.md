@@ -44,7 +44,7 @@ Aggregate every session from every machine:
 cp hosts.conf.example hosts.conf   # then edit
 python3 cc_collect.py --dry-run    # show every ssh/scp, touch nothing
 python3 cc_collect.py --no-deploy  # build into ./_site and inspect
-python3 cc_collect.py              # full run, scp → web:sessions/
+python3 cc_collect.py              # full run, scp → your deploy target
 ```
 
 `cc_collect.py` must run somewhere your SSH agent works — your laptop, not a sandbox.
@@ -52,15 +52,32 @@ It uses `BatchMode=yes`, so key-based auth to each host is required.
 
 ### hosts.conf
 
+All configuration lives here — the machines to collect from, and where to publish.
+
 ```
 # name    ssh-target        ("local" = the machine running the script)
 web       you@web.example.com
 axiom     you@axiom.example.com
 laptop    local
+
+# where to publish the built site
+deploy    web.example.com:sessions
 ```
 
-Gitignored, because it holds real hostnames. Override ad hoc with
-`--host name=user@target` (repeatable).
+Gitignored, because it holds real hostnames. That's deliberate: the deploy target
+lives here rather than as a default inside `cc_collect.py`, so your infrastructure
+names never reach the public repo.
+
+`deploy` is a reserved first word (no machine may be named `deploy`), and at most one
+`deploy` line is allowed. A bare path is relative to the remote user's home, so
+`web.example.com:sessions` lands in `~/sessions`; use an absolute path like
+`web.example.com:/var/www/sessions` if your web root is elsewhere.
+
+**There is no built-in deploy default.** With no `deploy` line and no `--deploy-to`,
+the run stops with an error rather than scp'ing somewhere you didn't intend.
+
+Override ad hoc: `--host name=user@target` (repeatable) for machines, and
+`--deploy-to HOST:PATH` for the target. CLI beats `hosts.conf`.
 
 ## What the pipeline does
 
@@ -137,7 +154,7 @@ Pages set `noindex`, but auth is what actually keeps them private.
 | `--no-thinking` | Omit Claude's thinking blocks |
 | `--no-redact` | Publish raw. Warns loudly. Don't. |
 | `--staging DIR` | Keep fetched JSONL around |
-| `--deploy-to H:P` | scp destination |
+| `--deploy-to H:P` | scp destination; overrides the `deploy` line in `hosts.conf` |
 | `--jobs N` | Parallel host fetches |
 
 ## Scheduling

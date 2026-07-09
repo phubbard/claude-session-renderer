@@ -1,8 +1,24 @@
 # Copy to hosts.conf and edit. hosts.conf is gitignored -- it holds real
-# hostnames and usernames.
+# hostnames, usernames, and your publish target.
+#
+# Machines to collect transcripts from:
 #
 #   <name>    <ssh-target>      ("local" = the machine running the script)
 
 web       you@web.example.com
 axiom     you@axiom.example.com
 laptop    local
+
+# Where to publish the built site. "deploy" is a reserved first word, so no
+# machine may be named "deploy". At most one deploy line.
+#
+#   deploy  <host>[:<path>]     (path defaults to "sessions")
+#
+# A bare path like "sessions" is relative to the remote user's home, so the
+# example below lands in ~/sessions. Point your web server's root there, or
+# give an absolute path: web.example.com:/var/www/sessions
+#
+# There is no built-in default. With no deploy line and no --deploy-to, the
+# run stops rather than scp'ing somewhere you didn't intend.
+
+deploy    web.example.com:sessions
