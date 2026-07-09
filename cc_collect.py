@@ -229,11 +229,37 @@ def fetch_host(name: str, target: str, staging: Path, verbose=True):
 # --------------------------------------------------------------------------- #
 # Step 2 + 3: render + index
 # --------------------------------------------------------------------------- #
-def render_all(host_data, site: Path, include_thinking=True, do_redact=True):
-    """host_data: {name: (platform, [paths])}. Returns (records, total Counter)."""
+def _uuid_graph(entries):
+    """Return (own_uuids, external_parent_uuid).
+
+    Entries in a transcript chain to each other via parentUuid. A sidechain root
+    -- the first turn of a subagent -- chains to an entry that lives in the
+    SPAWNING session, i.e. a uuid this transcript does not contain. That dangling
+    reference is what lets us reattach a subagent to its parent.
+    """
+    own = {e["uuid"] for e in entries if e.get("uuid")}
+    external = None
+    for e in entries:
+        p = e.get("parentUuid")
+        if p and p not in own:
+            external = p
+            break
+    return own, external
+
+
+def render_all(host_data, site: Path, include_thinking=True, do_redact=True,
+               skip_subagents=False):
+    """host_data: {name: (platform, [paths])}.
+
+    Returns (records, total Counter, uuid_index) where uuid_index maps
+    (host, uuid) -> session_id so subagents can be reattached to their parent.
+    """
     from collections import Counter
     records = []
     grand = Counter()
+    uuid_index = {}
+    pending = []  # (meta, entries, note, n_red, plat, name, path)
+
     for name, (plat, paths) in host_data.items():
         outdir = site / name
         outdir.mkdir(parents=True, exist_ok=True)
@@ -253,31 +279,99 @@ def render_all(host_data, site: Path, include_thinking=True, do_redact=True):
             meta = extract_meta(entries, p)
             if meta["turns"] == 0:
                 continue  # skip empty/aborted sessions
-            title = meta["description"]
-            doc = build_html(entries, title, f"{name}:{p.name}",
-                             include_thinking=include_thinking,
-                             redaction_note=note, redacted=do_redact)
-            rel = f"{name}/{meta['session_id']}.html"
-            (site / rel).write_text(doc, encoding="utf-8")
-            meta.update({
-                "host": name,
-                "platform": plat.get("pretty", "?"),
-                "os": plat.get("os", "?"),
-                "arch": plat.get("arch", ""),
-                "href": rel,
-                "bytes": (site / rel).stat().st_size,
-                "redactions": n_red,
-            })
-            records.append(meta)
+            if skip_subagents and meta["is_subagent"]:
+                continue
+
+            own, external = _uuid_graph(entries)
+            for u in own:
+                uuid_index[(name, u)] = meta["session_id"]
+            meta["parent_uuid"] = external
+
+            pending.append((meta, entries, note, n_red, plat, name, p))
+
+    # Render after the uuid index is complete, so nothing depends on file order.
+    for meta, entries, note, n_red, plat, name, p in pending:
+        doc = build_html(entries, meta["description"], f"{name}:{p.name}",
+                         include_thinking=include_thinking,
+                         redaction_note=note, redacted=do_redact)
+        rel = f"{name}/{meta['session_id']}.html"
+        (site / rel).write_text(doc, encoding="utf-8")
+        meta.update({
+            "host": name,
+            "platform": plat.get("pretty", "?"),
+            "os": plat.get("os", "?"),
+            "arch": plat.get("arch", ""),
+            "href": rel,
+            "bytes": (site / rel).stat().st_size,
+            "redactions": n_red,
+        })
+        records.append(meta)
+
     # Newest first, by session start.
     records.sort(key=lambda r: r["first_ts"] or "", reverse=True)
-    return records, grand
+    return records, grand, uuid_index
+
+
+def link_subagents(records, uuid_index):
+    """Attach each subagent record to a parent session id, in place.
+
+    Two strategies, in order:
+      1. Exact: the subagent's dangling parentUuid resolves, on the same host,
+         to a uuid owned by another session.
+      2. Heuristic: same host and same project directory, and the subagent ran
+         inside the parent's time window. Where several sessions qualify, the
+         one that started most recently before the subagent wins.
+
+    Anything still unattached is an orphan and gets surfaced under its project
+    rather than silently dropped.
+    """
+    by_id = {r["session_id"]: r for r in records}
+    mains = [r for r in records if not r["is_subagent"]]
+    exact = heuristic = orphan = 0
+
+    for r in records:
+        r["parent_id"] = None
+        r["children"] = []
+    for r in records:
+        if not r["is_subagent"]:
+            continue
+
+        pid = uuid_index.get((r["host"], r.get("parent_uuid")))
+        if pid and pid != r["session_id"] and pid in by_id:
+            r["parent_id"] = pid
+            r["link"] = "exact"
+            exact += 1
+            continue
+
+        cands = [
+            m for m in mains
+            if m["host"] == r["host"] and m["cwd"] == r["cwd"]
+            and m["first_ts"] and m["last_ts"] and r["first_ts"]
+            and m["first_ts"] <= r["first_ts"] <= m["last_ts"]
+        ]
+        if cands:
+            best = max(cands, key=lambda m: m["first_ts"])
+            r["parent_id"] = best["session_id"]
+            r["link"] = "inferred"
+            heuristic += 1
+        else:
+            r["link"] = "orphan"
+            orphan += 1
+
+    for r in records:
+        if r["parent_id"] and r["parent_id"] in by_id:
+            by_id[r["parent_id"]]["children"].append(r)
+    for m in mains:
+        m["children"].sort(key=lambda c: c["first_ts"] or "")
+
+    return {"exact": exact, "inferred": heuristic, "orphan": orphan}
 
 
 INDEX_CSS = """
-:root{--bg:#faf9f7;--fg:#1f1f1d;--muted:#6b6a66;--line:#e6e3dd;--card:#fff;--accent:#c15f3c;}
+:root{--bg:#faf9f7;--fg:#1f1f1d;--muted:#6b6a66;--line:#e6e3dd;--card:#fff;--accent:#c15f3c;
+--agent:#7a4f9c;}
 @media(prefers-color-scheme:dark){:root{--bg:#1a1a18;--fg:#e8e6df;--muted:#9a978f;
---line:#33322e;--card:#1f1e1c;}}
+--line:#33322e;--card:#1f1e1c;--agent:#a781c9;}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);
 font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
@@ -289,22 +383,46 @@ input[type=search]{flex:1;min-width:220px;padding:8px 12px;border:1px solid var(
 border-radius:8px;background:var(--card);color:var(--fg);font-size:14px;}
 select{padding:8px 10px;border:1px solid var(--line);border-radius:8px;
 background:var(--card);color:var(--fg);font-size:14px;}
-.group-date{margin:26px 0 8px;font-size:12px;font-weight:700;color:var(--muted);
-text-transform:uppercase;letter-spacing:.06em;}
+
+/* project -> session -> subagent hierarchy */
+.project{margin:30px 0 0;}
+.project-head{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;
+padding:0 0 6px;border-bottom:1px solid var(--line);margin-bottom:6px;}
+.project-name{font-size:15px;font-weight:700;}
+.project-path{color:var(--muted);font-size:12px;font-family:ui-monospace,Menlo,monospace;
+overflow-wrap:anywhere;}
+.project-meta{color:var(--muted);font-size:12px;margin-left:auto;}
+
+.session{margin:8px 0;}
 .row{display:block;text-decoration:none;color:inherit;background:var(--card);
-border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin:8px 0;
+border:1px solid var(--line);border-radius:10px;padding:12px 14px;
 transition:border-color .12s,transform .12s;}
 .row:hover{border-color:var(--accent);transform:translateY(-1px);}
 .row .desc{font-weight:600;margin-bottom:6px;overflow-wrap:anywhere;}
 .row .facts{display:flex;gap:8px;flex-wrap:wrap;align-items:center;
 color:var(--muted);font-size:12px;}
+
+/* subagents: nested, quieter, collapsed by default */
+.subs{margin:2px 0 0 22px;border-left:2px solid var(--line);padding-left:12px;}
+.subs>summary{cursor:pointer;list-style:none;user-select:none;
+font-size:12px;color:var(--muted);padding:5px 0;}
+.subs>summary::-webkit-details-marker{display:none}
+.subs>summary:before{content:"\25b8 ";color:var(--agent);font-weight:700;}
+.subs[open]>summary:before{content:"\25be ";}
+.subs>summary:hover{color:var(--fg);}
+.row.sub{background:transparent;border-style:dashed;padding:8px 10px;margin:4px 0;}
+.row.sub .desc{font-weight:500;font-size:13px;color:var(--muted);margin-bottom:4px;}
+.row.sub:hover .desc{color:var(--fg);}
+.row.sub .facts{font-size:11px;}
+
 .badge{display:inline-block;font-size:11px;font-weight:650;padding:2px 8px;border-radius:20px;
 letter-spacing:.02em;color:#fff;}
 .host-web{background:#2f6f9f;}.host-axiom{background:#7a4f9c;}
 .host-laptop{background:#4a7c59;}.host-other{background:#7a7a72;}
-.agent-badge{background:#7a4f9c;}
+.agent-badge{background:transparent;border:1px solid var(--agent);color:var(--agent);}
 .redact-badge{background:transparent;border:1px solid #b3453a;color:#b3453a;}
-.row.subagent{border-left:3px solid #7a4f9c;}
+.link-inferred{border:1px dashed var(--muted);color:var(--muted);background:transparent;}
+.orphan-head{color:var(--muted);}
 .os-Linux{border:1px solid #d9772e;color:#d9772e;background:transparent;}
 .os-Darwin{border:1px solid #6b6a66;color:var(--muted);background:transparent;}
 .os-\\?{border:1px solid var(--line);color:var(--muted);background:transparent;}
@@ -317,73 +435,155 @@ border-top:1px solid var(--line);padding-top:16px;}
 """
 
 
-def build_index(records, host_data) -> str:
+def _host_cls(host):
+    return f"host-{host}" if host in ("web", "axiom", "laptop") else "host-other"
+
+
+def _facts(r, compact=False):
+    bits = [f'<span class="badge {_host_cls(r["host"])}">{esc(r["host"])}</span>']
+    if not compact:
+        bits.append(f'<span class="badge os-{esc(r["os"])}">{esc(r["platform"])}</span>')
+
+    if r.get("is_subagent"):
+        at = f' {esc(r["agent_type"])}' if r.get("agent_type") else ""
+        bits.append(f'<span class="badge agent-badge">subagent{at}</span>')
+        if r.get("link") == "inferred":
+            bits.append('<span class="badge link-inferred" '
+                        'title="Parent inferred from project and time window, '
+                        'not an explicit link">inferred parent</span>')
+
+    if r.get("redactions"):
+        n = r["redactions"]
+        bits.append(f'<span class="badge redact-badge" '
+                    f'title="{n} secret{"s" if n != 1 else ""} scrubbed">'
+                    f'&#128737; {n}</span>')
+
+    started = _fmt_ts(r["first_ts"])[:16] if r["first_ts"] else ""
+    bits += [x for x in [
+        started,
+        f"{r['turns']} turns",
+        f"{r['tool_calls']} tool calls" if r["tool_calls"] else "",
+        f"<code>{esc(r['session_id'][:8])}</code>",
+    ] if x]
+    return " &middot; ".join(bits)
+
+
+def _search_blob(r):
+    return esc(" ".join([
+        r["description"], r["host"], r["platform"], r["project"], r["cwd"],
+        r["session_id"], "subagent" if r["is_subagent"] else "main",
+        r.get("agent_type", ""),
+    ]).lower())
+
+
+def _row(r, sub=False):
+    cls = "row sub" if sub else "row"
+    kind = "subagent" if r["is_subagent"] else "main"
+    return (
+        f'<a class="{cls}" href="{esc(r["href"])}" data-host="{esc(r["host"])}" '
+        f'data-kind="{kind}" data-search="{_search_blob(r)}">'
+        f'<div class="desc">{esc(r["description"])}</div>'
+        f'<div class="facts">{_facts(r, compact=sub)}</div></a>'
+    )
+
+
+def _subs_block(children):
+    """Collapsed <details> holding a session's subagent runs."""
+    if not children:
+        return ""
+    n = len(children)
+    label = f"{n} subagent run{'s' if n != 1 else ''}"
+    inner = "".join(_row(c, sub=True) for c in children)
+    return (f'<details class="subs"><summary data-subsummary>{label}</summary>'
+            f'{inner}</details>')
+
+
+def build_index(records, host_data, link_stats=None) -> str:
     hosts = sorted({r["host"] for r in records})
     generated = _dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
-
     host_opts = "".join(f'<option value="{esc(h)}">{esc(h)}</option>' for h in hosts)
 
-    # Per-host summary line (includes hosts with zero sessions / unreachable).
+    mains = [r for r in records if not r["is_subagent"]]
+    subs = [r for r in records if r["is_subagent"]]
+    orphans = [r for r in subs if not r.get("parent_id")]
+
+    # Per-host summary (includes hosts with zero sessions / unreachable).
     sums = []
     for name, (plat, paths) in sorted(host_data.items()):
-        n = sum(1 for r in records if r["host"] == name)
+        n = sum(1 for r in mains if r["host"] == name)
+        a = sum(1 for r in subs if r["host"] == name)
         p = plat.get("pretty", "?")
         arch = plat.get("arch", "")
-        arch = f" · {esc(arch)}" if arch else ""
-        sums.append(f"<span><strong>{esc(name)}</strong>: {esc(p)}{arch} · {n} sessions</span>")
+        arch = f" &middot; {esc(arch)}" if arch else ""
+        extra = f" (+{a} subagent)" if a else ""
+        sums.append(f"<span><strong>{esc(name)}</strong>: {esc(p)}{arch} &middot; "
+                    f"{n} sessions{extra}</span>")
 
-    rows, last_group = [], None
-    for r in records:
-        day = (r["first_ts"] or "")[:10]
-        group = day or "undated"
-        if group != last_group:
-            label = group
-            if day:
-                try:
-                    label = _dt.date.fromisoformat(day).strftime("%A, %d %B %Y")
-                except ValueError:
-                    pass
-            rows.append(f'<div class="group-date" data-group>{esc(label)}</div>')
-            last_group = group
+    # ---- group into projects, keyed by (host, cwd) ------------------------
+    projects = {}
+    for r in mains + orphans:
+        projects.setdefault((r["host"], r["cwd"]), {"mains": [], "orphans": []})
+    for r in mains:
+        projects[(r["host"], r["cwd"])]["mains"].append(r)
+    for r in orphans:
+        projects[(r["host"], r["cwd"])]["orphans"].append(r)
 
-        host_cls = f"host-{r['host']}" if r["host"] in ("web", "axiom", "laptop") else "host-other"
-        os_cls = f"os-{r['os']}"
-        started = _fmt_ts(r["first_ts"])[-8:] if r["first_ts"] else ""
-        proj = f"<code>{esc(r['project'])}</code>" if r["project"] else ""
-        tools = f"{r['tool_calls']} tool calls" if r["tool_calls"] else ""
+    def last_activity(bucket):
+        ts = [m["last_ts"] or m["first_ts"] or "" for m in bucket["mains"]]
+        ts += [o["last_ts"] or o["first_ts"] or "" for o in bucket["orphans"]]
+        return max(ts) if ts else ""
 
-        agent = ""
-        if r.get("is_subagent"):
-            at = f' {esc(r["agent_type"])}' if r.get("agent_type") else ""
-            agent = f'<span class="badge agent-badge">subagent{at}</span>'
-        red = ""
-        if r.get("redactions"):
-            n = r["redactions"]
-            red = (f'<span class="badge redact-badge" '
-                   f'title="{n} secret{"s" if n != 1 else ""} scrubbed">'
-                   f'🛡 {n} redacted</span>')
+    ordered = sorted(projects.items(), key=lambda kv: last_activity(kv[1]), reverse=True)
 
-        facts = " · ".join(x for x in [
-            f'<span class="badge {host_cls}">{esc(r["host"])}</span>',
-            f'<span class="badge {os_cls}">{esc(r["platform"])}</span>',
-            agent, red,
-            started, proj, f"{r['turns']} turns", tools,
-            f"<code>{esc(r['session_id'][:8])}</code>",
-        ] if x)
+    sections = []
+    for (host, cwd), bucket in ordered:
+        bucket["mains"].sort(key=lambda m: m["first_ts"] or "", reverse=True)
+        bucket["orphans"].sort(key=lambda m: m["first_ts"] or "", reverse=True)
 
-        kind = "subagent" if r.get("is_subagent") else "main"
-        search_blob = esc(" ".join([
-            r["description"], r["host"], r["platform"], r["project"],
-            r["session_id"], kind, r.get("agent_type", ""),
-        ]).lower())
+        name = os.path.basename(cwd) or cwd or "(unknown project)"
+        n_sess = len(bucket["mains"])
+        n_sub = sum(len(m["children"]) for m in bucket["mains"]) + len(bucket["orphans"])
+        last = last_activity(bucket)[:10]
 
-        rows.append(
-            f'<a class="row{" subagent" if kind == "subagent" else ""}" '
-            f'href="{esc(r["href"])}" data-host="{esc(r["host"])}" '
-            f'data-kind="{kind}" data-search="{search_blob}">'
-            f'<div class="desc">{esc(r["description"])}</div>'
-            f'<div class="facts">{facts}</div></a>'
+        body = []
+        for m in bucket["mains"]:
+            body.append(f'<div class="session" data-session>'
+                        f'{_row(m)}{_subs_block(m["children"])}</div>')
+
+        if bucket["orphans"]:
+            n = len(bucket["orphans"])
+            inner = "".join(_row(o, sub=True) for o in bucket["orphans"])
+            body.append(
+                f'<div class="session" data-session>'
+                f'<details class="subs"><summary data-subsummary class="orphan-head">'
+                f'{n} unattached subagent run{"s" if n != 1 else ""} '
+                f'&mdash; no parent session found</summary>{inner}</details></div>'
+            )
+
+        meta = f"{n_sess} session{'s' if n_sess != 1 else ''}"
+        if n_sub:
+            meta += f" &middot; {n_sub} subagent"
+        if last:
+            meta += f" &middot; last {esc(last)}"
+
+        sections.append(
+            f'<section class="project" data-project data-host="{esc(host)}">'
+            f'<div class="project-head">'
+            f'<span class="project-name">{esc(name)}</span>'
+            f'<span class="badge {_host_cls(host)}">{esc(host)}</span>'
+            f'<span class="project-path">{esc(cwd)}</span>'
+            f'<span class="project-meta">{meta}</span>'
+            f'</div>{"".join(body)}</section>'
         )
+
+    stats = ""
+    if link_stats and subs:
+        bits = [f"{link_stats['exact']} linked"]
+        if link_stats["inferred"]:
+            bits.append(f"{link_stats['inferred']} inferred")
+        if link_stats["orphan"]:
+            bits.append(f"{link_stats['orphan']} unattached")
+        stats = f" &middot; {len(subs)} subagent runs ({', '.join(bits)})"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -397,56 +597,77 @@ def build_index(records, host_data) -> str:
 <body>
 <div class="wrap">
 <h1>Claude Code sessions</h1>
-<div class="sub">{len(records)} sessions across {len(host_data)} machines · generated {esc(generated)}</div>
+<div class="sub">{len(mains)} sessions across {len(host_data)} machines{stats} &middot;
+generated {esc(generated)}</div>
 <div class="hostsum">{"".join(sums)}</div>
 
 <div class="controls">
-  <input type="search" id="q" placeholder="Search descriptions, projects, session ids…" autocomplete="off">
+  <input type="search" id="q" placeholder="Search descriptions, projects, session ids&hellip;" autocomplete="off">
   <select id="hostf"><option value="">All machines</option>{host_opts}</select>
-  <select id="kindf">
-    <option value="">Main + subagents</option>
-    <option value="main">Main sessions only</option>
-    <option value="subagent">Subagents only</option>
+  <select id="subf">
+    <option value="collapsed">Subagents: collapsed</option>
+    <option value="expanded">Subagents: expanded</option>
+    <option value="hidden">Subagents: hidden</option>
   </select>
 </div>
 
 <div id="list">
-{"".join(rows) if rows else '<div class="empty">No sessions found.</div>'}
+{"".join(sections) if sections else '<div class="empty">No sessions found.</div>'}
 </div>
 
-<footer>Self-hosted transcript index · no external requests · serve behind auth</footer>
+<footer>Self-hosted transcript index &middot; no external requests &middot; serve behind auth</footer>
 </div>
 <script>
 (function(){{
   var q=document.getElementById('q'), hf=document.getElementById('hostf'),
-      kf=document.getElementById('kindf');
-  var rows=[].slice.call(document.querySelectorAll('.row'));
-  var groups=[].slice.call(document.querySelectorAll('[data-group]'));
+      sf=document.getElementById('subf');
+  var projects=[].slice.call(document.querySelectorAll('[data-project]'));
+  var sessions=[].slice.call(document.querySelectorAll('[data-session]'));
+
   function apply(){{
-    var t=q.value.trim().toLowerCase(), h=hf.value, k=kf.value;
-    rows.forEach(function(r){{
-      var ok=(!t||r.dataset.search.indexOf(t)>-1)
-           &&(!h||r.dataset.host===h)
-           &&(!k||r.dataset.kind===k);
-      r.style.display=ok?'':'none';
-    }});
-    // Hide date headers whose rows are all hidden.
-    groups.forEach(function(g){{
-      var n=g.nextElementSibling, any=false;
-      while(n&&!n.hasAttribute('data-group')){{
-        if(n.classList.contains('row')&&n.style.display!=='none') any=true;
-        n=n.nextElementSibling;
+    var t=q.value.trim().toLowerCase(), h=hf.value, mode=sf.value;
+
+    sessions.forEach(function(sess){{
+      var main=sess.querySelector('.row:not(.sub)');
+      var subs=[].slice.call(sess.querySelectorAll('.row.sub'));
+      var det=sess.querySelector('details.subs');
+
+      var mainOk = main ? ((!t||main.dataset.search.indexOf(t)>-1)
+                          &&(!h||main.dataset.host===h)) : false;
+      var subHits=0;
+      subs.forEach(function(s){{
+        var ok=(!t||s.dataset.search.indexOf(t)>-1)&&(!h||s.dataset.host===h);
+        s.style.display=(t&&!ok)?'none':'';
+        if(ok) subHits++;
+      }});
+
+      if(det){{
+        det.style.display=(mode==='hidden'||subHits===0)?'none':'';
+        det.open=(mode==='expanded')||(!!t&&subHits>0);
       }}
-      g.style.display=any?'':'none';
+      var keep = mainOk || (subHits>0 && mode!=='hidden');
+      if(!main) keep = subHits>0 && mode!=='hidden';
+      sess.style.display=keep?'':'none';
+    }});
+
+    projects.forEach(function(p){{
+      var any=[].slice.call(p.querySelectorAll('[data-session]'))
+                 .some(function(s){{return s.style.display!=='none';}});
+      var hostOk=!h||p.dataset.host===h;
+      p.style.display=(any&&hostOk)?'':'none';
     }});
   }}
-  q.addEventListener('input',apply); hf.addEventListener('change',apply);
-  kf.addEventListener('change',apply);
+
+  q.addEventListener('input',apply);
+  hf.addEventListener('change',apply);
+  sf.addEventListener('change',apply);
+  apply();
 }})();
 </script>
 </body>
 </html>
 """
+
 
 
 # --------------------------------------------------------------------------- #
@@ -494,6 +715,8 @@ def main(argv=None):
     ap.add_argument("--no-deploy", action="store_true", help="Build locally, don't scp")
     ap.add_argument("--dry-run", action="store_true", help="Show actions, change nothing remote")
     ap.add_argument("--no-thinking", action="store_true", help="Omit thinking blocks")
+    ap.add_argument("--skip-subagents", action="store_true",
+                    help="Don't render subagent runs at all; omit them from the index")
     ap.add_argument("--no-redact", action="store_true",
                     help="DANGEROUS: publish raw transcripts without scrubbing credentials")
     ap.add_argument("--jobs", type=int, default=4, help="Parallel host fetches")
@@ -584,20 +807,31 @@ def main(argv=None):
           f"{'' if not args.no_redact else '  (REDACTION DISABLED)'}")
     clean_dir(site)
     site.mkdir(parents=True, exist_ok=True)
-    records, grand = render_all(host_data, site,
-                                include_thinking=not args.no_thinking,
-                                do_redact=not args.no_redact)
-    n_agents = sum(1 for r in records if r.get("is_subagent"))
-    print(f"  rendered {len(records)} non-empty sessions ({n_agents} subagent runs)")
+    records, grand, uuid_index = render_all(host_data, site,
+                                            include_thinking=not args.no_thinking,
+                                            do_redact=not args.no_redact,
+                                            skip_subagents=args.skip_subagents)
+    n_main = sum(1 for r in records if not r["is_subagent"])
+    n_agents = len(records) - n_main
+    print(f"  rendered {n_main} sessions"
+          + (f" + {n_agents} subagent runs" if n_agents else ""))
     if not args.no_redact:
         s = summarize(grand)
         print(f"  redaction: {s or 'no known secret patterns found'}")
 
     print("\n[3/4] index")
-    (site / "index.html").write_text(build_index(records, host_data), encoding="utf-8")
+    link_stats = link_subagents(records, uuid_index)
+    if n_agents:
+        print(f"  subagents: {link_stats['exact']} linked by uuid, "
+              f"{link_stats['inferred']} inferred from project+time, "
+              f"{link_stats['orphan']} unattached")
+    (site / "index.html").write_text(
+        build_index(records, host_data, link_stats), encoding="utf-8")
+    n_proj = len({(r["host"], r["cwd"]) for r in records if not r["is_subagent"]})
     span = ""
     if records:
         span = f" ({records[-1]['first_ts'][:10]} → {records[0]['first_ts'][:10]})"
+    span += f", {n_proj} projects"
     print(f"  index.html — {len(records)} sessions{span}")
 
     # ---- 4. deploy

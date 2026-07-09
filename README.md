@@ -86,8 +86,9 @@ Override ad hoc: `--host name=user@target` (repeatable) for machines, and
    (`--jobs`, default 4). Unreachable hosts are reported and skipped, never fatal.
 2. **render** — each transcript → `_site/<host>/<session-id>.html`. Redaction runs here.
    Empty/aborted sessions (zero turns) are dropped.
-3. **index** — `_site/index.html`, newest first, grouped by day. Live search box,
-   per-machine filter, main-vs-subagent filter.
+3. **index** — `_site/index.html`, grouped project → session → subagents, projects
+   ordered by most recent activity. Live search box, per-machine filter, subagent
+   visibility toggle.
 4. **deploy** — `ssh mkdir -p` then `scp -r` to your web root.
 
 ## Redaction
@@ -125,14 +126,49 @@ different from bulk-publishing every session from a production host. **Do a `--n
 run and skim `_site/index.html` before your first real publish.** `--no-redact` exists,
 prints a warning, and should stay unused.
 
+## Index structure
+
+The index is a three-level hierarchy: **project → session → subagent runs.**
+
+Projects are keyed by `(host, working directory)` and ordered by most recent activity.
+Within a project, sessions are newest-first. Subagent runs are nested under the session
+that spawned them, **collapsed behind a toggle**, in a dashed, quieter style — they're
+rarely what you're looking for.
+
+The `Subagents:` selector switches between collapsed (default), expanded, and hidden.
+`--skip-subagents` omits them from the build entirely.
+
+Searching matches subagents too, and auto-expands any parent whose child matched.
+
 ## Subagent sessions
 
 Claude Code marks subagent turns with `isSidechain`. A transcript whose only user turns
-are sidechain turns is a subagent run with no top-level prompt. Rather than showing these
-as "(no description)", descriptions fall back through: the session `summary` → the first
-top-level user prompt → the spawning `Task` call's description/prompt → the first
-sidechain turn (the agent's own instructions) → the first assistant prose → a labeled
-placeholder. Subagent rows get a badge, a left border, and their own index filter.
+are sidechain turns is a subagent run with no top-level prompt.
+
+**Descriptions.** Rather than showing "(no description)", these fall back through: the
+session `summary` → the first top-level user prompt → the spawning `Task` call's
+description/prompt → the first sidechain turn (the agent's own instructions) → the first
+assistant prose → a labeled placeholder.
+
+**Parent linkage.** Entries chain to each other via `parentUuid`. A sidechain's root turn
+chains to an entry in the *spawning* session — a uuid the subagent's own transcript does
+not contain. That dangling reference is what reattaches a subagent to its parent. Linkage
+is resolved per host, so a uuid collision across machines can't cross-link them.
+
+Two strategies, in order:
+
+1. **Exact** — the dangling `parentUuid` resolves, on the same host, to a uuid owned by
+   another session.
+2. **Inferred** — same host, same project directory, and the subagent ran inside the
+   parent's time window. Where several sessions qualify, the one that started most
+   recently before the subagent wins. These are tagged `inferred parent` in the index,
+   because the link is a guess, not a fact.
+
+Anything still unattached is an **orphan**, surfaced under its project in an "unattached
+subagent runs" group rather than silently dropped. Older transcripts that predate `uuid`
+fields land here — that's expected, not a bug.
+
+The build prints the breakdown: `2 linked by uuid, 1 inferred from project+time, 1 unattached`.
 
 ## Serving it
 
@@ -152,6 +188,7 @@ Pages set `noindex`, but auth is what actually keeps them private.
 | `--no-deploy` | Build locally into `./_site` |
 | `--no-fetch` | Rebuild from an existing `--staging` dir; no SSH |
 | `--no-thinking` | Omit Claude's thinking blocks |
+| `--skip-subagents` | Don't render subagent runs at all |
 | `--no-redact` | Publish raw. Warns loudly. Don't. |
 | `--staging DIR` | Keep fetched JSONL around |
 | `--deploy-to H:P` | scp destination; overrides the `deploy` line in `hosts.conf` |
