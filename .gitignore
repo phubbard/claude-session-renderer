@@ -1,0 +1,17 @@
+# Real host list: contains internal hostnames + usernames.
+hosts.conf
+
+# Build + fetch artifacts. Transcripts and rendered pages must never be committed.
+_site/
+stage/
+staging/
+*.jsonl
+*.html
+!tests/**/*.html
+publish.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

@@ -1,0 +1,59 @@
+# --------------------------------------------------------------------------
+# Caddy2 snippet for serving password-protected Claude Code session transcripts
+# on web.example.com. Add this to your Caddyfile (or /etc/caddy/Caddyfile).
+#
+# Generate the bcrypt hash for your shared password first:
+#     caddy hash-password --plaintext 'your-team-password'
+# Paste the resulting hash below (starts with $2a$...). Escape any '$' in a
+# Caddyfile by doubling it: '$' -> '$$'  (caddy hash-password output already
+# handles this when you use an env var; see note at bottom).
+# --------------------------------------------------------------------------
+
+web.example.com {
+	root * /var/www/sessions
+	file_server browse   # optional directory listing of published transcripts
+
+	# One shared login for the whole team. Everything under the site is gated.
+	basic_auth {
+		team $2a$14$REPLACE_WITH_YOUR_BCRYPT_HASH_FROM_caddy_hash_password
+	}
+
+	# Transcripts are static HTML; let browsers cache them briefly.
+	header /*.html Cache-Control "private, max-age=300"
+
+	# Belt-and-suspenders: keep these out of search engines.
+	header X-Robots-Tag "noindex, nofollow"
+
+	encode gzip zstd
+	log {
+		output file /var/log/caddy/sessions.log
+	}
+}
+
+# --------------------------------------------------------------------------
+# If you'd rather gate ONLY a subpath (e.g. web.example.com/sessions/*)
+# instead of the whole host, use a matcher instead:
+#
+#   web.example.com {
+#       root * /var/www/html
+#       file_server
+#       @sessions path /sessions/*
+#       basic_auth @sessions {
+#           team $2a$14$REPLACE_WITH_YOUR_BCRYPT_HASH
+#       }
+#   }
+#
+# --------------------------------------------------------------------------
+# Per-viewer logins (instead of one shared password): add more lines inside
+# the basic_auth block, one "username hash" per person:
+#
+#   basic_auth {
+#       paul  $2a$14$...
+#       alice $2a$14$...
+#       bob   $2a$14$...
+#   }
+#
+# --------------------------------------------------------------------------
+# Reload after editing:   sudo systemctl reload caddy
+#                or:      caddy reload --config /etc/caddy/Caddyfile
+# --------------------------------------------------------------------------

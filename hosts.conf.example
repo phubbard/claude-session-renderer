@@ -1,0 +1,8 @@
+# Copy to hosts.conf and edit. hosts.conf is gitignored -- it holds real
+# hostnames and usernames.
+#
+#   <name>    <ssh-target>      ("local" = the machine running the script)
+
+web       you@web.example.com
+axiom     you@axiom.example.com
+laptop    local
