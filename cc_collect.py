@@ -6,9 +6,10 @@ password-protected, date-ordered browsable index, then deploy it.
 Pipeline:
     1. fetch    For each configured host: probe platform, pull ~/.claude/projects/**/*.jsonl
     2. render   Render every session to a self-contained HTML page (via publish_session.py)
-    3. index    Build index.html ordered by date, with inferred descriptions
+    3. search   Build a full-text search index with pagefind (skipped if unavailable)
+    4. index    Build index.html ordered by date, with inferred descriptions
                 and machine/platform annotations
-    4. deploy   scp the whole tree to the configured target
+    5. deploy   scp the whole tree to the configured target
 
 Requires: ssh + scp on this machine, and working key-based auth to each host.
 Run it from wherever your SSH agent lives (your laptop), NOT from a sandbox.
@@ -379,9 +380,16 @@ def render_all(host_data, site: Path, include_thinking=True, do_redact=True,
         if id(meta) not in keep_ids:
             continue
         (site / name).mkdir(parents=True, exist_ok=True)
+        search_meta = {
+            "host": meta["host"],
+            "project": meta["project"] or "(unknown)",
+            "kind": "subagent" if meta["is_subagent"] else "session",
+            "date": (meta["first_ts"] or "")[:10],
+        }
         doc = build_html(entries, meta["description"], f"{name}:{p.name}",
                          include_thinking=include_thinking,
-                         redaction_note=note, redacted=do_redact)
+                         redaction_note=note, redacted=do_redact,
+                         search_meta=search_meta)
         rel = f"{name}/{meta['session_id']}.html"
         (site / rel).write_text(doc, encoding="utf-8")
         meta["href"] = rel
@@ -446,6 +454,44 @@ def link_subagents(records, uuid_index):
         m["children"].sort(key=lambda c: c["first_ts"] or "")
 
     return {"exact": exact, "inferred": heuristic, "orphan": orphan}
+
+
+# --------------------------------------------------------------------------- #
+# Step 3: full-text search (pagefind)
+# --------------------------------------------------------------------------- #
+def pagefind_cmd():
+    """Locate a way to run pagefind: a real binary, else npx. None if neither."""
+    if shutil.which("pagefind"):
+        return ["pagefind"]
+    if shutil.which("npx"):
+        return ["npx", "-y", "pagefind@1"]
+    return None
+
+
+def build_search_index(site: Path) -> bool:
+    """Run pagefind over the rendered site, writing site/pagefind/.
+
+    Runs BEFORE index.html is written, so the index page itself is never in the
+    search corpus (only pages tagged data-pagefind-body are indexed anyway).
+    The bundle is served from the site's own origin, preserving the
+    no-external-requests property. Failure is non-fatal: the site still works,
+    just without full-text search.
+    """
+    cmd = pagefind_cmd()
+    if cmd is None:
+        print("  pagefind not found — install the binary or Node (npx); "
+              "skipping full-text search", file=sys.stderr)
+        return False
+    r = run([*cmd, "--site", str(site)])
+    if r.returncode != 0:
+        print(f"  pagefind failed: {(r.stderr or r.stdout).strip()[:300]}", file=sys.stderr)
+        return False
+    m = re.search(r"Indexed (\d+) page", r.stdout)
+    pages = m.group(1) if m else "?"
+    m = re.search(r"Indexed (\d+) word", r.stdout)
+    words = m.group(1) if m else "?"
+    print(f"  pagefind: indexed {pages} pages, {words} words → {site / 'pagefind'}/")
+    return True
 
 
 INDEX_CSS = """
@@ -515,6 +561,15 @@ font:12px ui-monospace,Menlo,Consolas,monospace;}
 footer{margin-top:44px;color:var(--muted);font-size:12px;text-align:center;
 border-top:1px solid var(--line);padding-top:16px;}
 .hostsum{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:8px;font-size:12px;color:var(--muted);}
+
+/* pagefind full-text search, themed to match */
+#fulltext{margin:0 0 18px;}
+#fulltext .hint{color:var(--muted);font-size:12px;margin:0 0 6px;}
+#pf-search{--pagefind-ui-scale:.85;--pagefind-ui-primary:var(--accent);
+--pagefind-ui-text:var(--fg);--pagefind-ui-background:var(--card);
+--pagefind-ui-border:var(--line);--pagefind-ui-tag:var(--line);
+--pagefind-ui-border-width:1px;--pagefind-ui-border-radius:8px;
+--pagefind-ui-font:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
 """
 
 
@@ -593,7 +648,7 @@ def _subs_block(children):
             f'{inner}</details>')
 
 
-def build_index(records, host_data, link_stats=None) -> str:
+def build_index(records, host_data, link_stats=None, search=False) -> str:
     hosts = sorted({r["host"] for r in records})
     generated = _dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
     host_opts = "".join(f'<option value="{esc(h)}">{esc(h)}</option>' for h in hosts)
@@ -680,6 +735,25 @@ def build_index(records, host_data, link_stats=None) -> str:
             bits.append(f"{link_stats['orphan']} unattached")
         stats = f" &middot; {len(subs)} subagent runs ({', '.join(bits)})"
 
+    # Full-text search (pagefind). Assets live in ./pagefind/ next to this file —
+    # same origin, no external requests. The block stays hidden unless the
+    # bundle actually loaded, so a build without pagefind degrades cleanly.
+    pf_head = pf_block = pf_script = ""
+    if search:
+        pf_head = ('<link rel="stylesheet" href="pagefind/pagefind-ui.css">\n'
+                   '<script src="pagefind/pagefind-ui.js"></script>')
+        pf_block = ('<div id="fulltext" style="display:none">'
+                    '<div class="hint">Full-text search inside every transcript '
+                    '(prose, thinking, tool output)</div>'
+                    '<div id="pf-search"></div></div>')
+        pf_script = """<script>
+if(window.PagefindUI){
+  document.getElementById('fulltext').style.display='';
+  new PagefindUI({element:'#pf-search',showImages:false,pageSize:8,
+    translations:{placeholder:'Search inside transcripts\\u2026'}});
+}
+</script>"""
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -688,6 +762,7 @@ def build_index(records, host_data, link_stats=None) -> str:
 <meta name="robots" content="noindex,nofollow">
 <title>Claude Code sessions</title>
 <style>{INDEX_CSS}</style>
+{pf_head}
 </head>
 <body>
 <div class="wrap">
@@ -696,8 +771,10 @@ def build_index(records, host_data, link_stats=None) -> str:
 generated {esc(generated)}</div>
 <div class="hostsum">{"".join(sums)}</div>
 
+{pf_block}
+
 <div class="controls">
-  <input type="search" id="q" placeholder="Search descriptions, projects, session ids&hellip;" autocomplete="off">
+  <input type="search" id="q" placeholder="Filter list: descriptions, projects, session ids&hellip;" autocomplete="off">
   <select id="hostf"><option value="">All machines</option>{host_opts}</select>
   <select id="subf">
     <option value="collapsed">Subagents: collapsed</option>
@@ -759,6 +836,7 @@ generated {esc(generated)}</div>
   apply();
 }})();
 </script>
+{pf_script}
 </body>
 </html>
 """
@@ -818,6 +896,8 @@ def main(argv=None):
                     help="Print where each session's description came from, then exit")
     ap.add_argument("--no-redact", action="store_true",
                     help="DANGEROUS: publish raw transcripts without scrubbing credentials")
+    ap.add_argument("--no-search", action="store_true",
+                    help="Skip the pagefind full-text search index")
     ap.add_argument("--jobs", type=int, default=4, help="Parallel host fetches")
     args = ap.parse_args(argv)
 
@@ -861,7 +941,7 @@ def main(argv=None):
     # ---- 1. fetch
     host_data = {}
     if args.no_fetch:
-        print("\n[1/4] fetch — skipped (--no-fetch), reading staging dir")
+        print("\n[1/5] fetch — skipped (--no-fetch), reading staging dir")
         for name, target in hosts:
             d = staging / name
             paths = sorted(d.glob("*.jsonl")) if d.exists() else []
@@ -871,7 +951,7 @@ def main(argv=None):
             host_data[name] = (plat, paths)
             print(f"  [{name}] {len(paths)} sessions from staging")
     else:
-        print(f"\n[1/4] fetch — probing {len(hosts)} hosts over SSH")
+        print(f"\n[1/5] fetch — probing {len(hosts)} hosts over SSH")
         if args.dry_run:
             for name, target in hosts:
                 if target == "local":
@@ -885,7 +965,10 @@ def main(argv=None):
                 tail = f"scp → {deploy_target}/"
             else:
                 tail = "NO DEPLOY TARGET (add a 'deploy' line to hosts.conf)"
-            print(f"  would render → {args.site}, then {tail}")
+            pf = "skip search (--no-search)" if args.no_search else \
+                ("pagefind full-text index" if pagefind_cmd() else
+                 "skip search (pagefind not found)")
+            print(f"  would render → {args.site}, then {pf}, then {tail}")
             return 0
         with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
             futs = {ex.submit(fetch_host, n, t, staging): n for n, t in hosts}
@@ -901,8 +984,8 @@ def main(argv=None):
         print("\nNo transcripts found on any host. Nothing to do.", file=sys.stderr)
         return 1
 
-    # ---- 2 + 3. render + index
-    print(f"\n[2/4] render — {total} sessions"
+    # ---- 2. render
+    print(f"\n[2/5] render — {total} sessions"
           f"{'' if not args.no_redact else '  (REDACTION DISABLED)'}")
     clean_dir(site)
     site.mkdir(parents=True, exist_ok=True)
@@ -944,14 +1027,23 @@ def main(argv=None):
         s = summarize(grand)
         print(f"  redaction: {s or 'no known secret patterns found'}")
 
-    print("\n[3/4] index")
+    # ---- 3. search — before index.html exists, so it can never be in the corpus
+    print("\n[3/5] search")
+    if args.no_search:
+        search_ok = False
+        print("  skipped (--no-search)")
+    else:
+        search_ok = build_search_index(site)
+
+    # ---- 4. index
+    print("\n[4/5] index")
     link_stats = link_subagents(records, uuid_index)
     if n_agents:
         print(f"  subagents: {link_stats['exact']} linked by uuid, "
               f"{link_stats['inferred']} inferred from project+time, "
               f"{link_stats['orphan']} unattached")
     (site / "index.html").write_text(
-        build_index(records, host_data, link_stats), encoding="utf-8")
+        build_index(records, host_data, link_stats, search=search_ok), encoding="utf-8")
     n_proj = len({(r["host"], r["cwd"]) for r in records if not r["is_subagent"]})
     span = ""
     if records:
@@ -959,8 +1051,8 @@ def main(argv=None):
     span += f", {n_proj} projects"
     print(f"  index.html — {len(records)} sessions{span}")
 
-    # ---- 4. deploy
-    print("\n[4/4] deploy")
+    # ---- 5. deploy
+    print("\n[5/5] deploy")
     if args.no_deploy:
         print(f"  skipped (--no-deploy). Built tree: {site.resolve()}")
     else:

@@ -12,7 +12,8 @@ none of that: your transcripts, your web server, your auth.
 ## What you get
 
 - `publish_session.py` — one transcript → one styled, self-contained HTML page.
-- `cc_collect.py` — SSH to N machines, render everything, build a date-ordered index, deploy.
+- `cc_collect.py` — SSH to N machines, render everything, build a full-text search
+  index (pagefind) and a date-ordered browse index, deploy.
 - `redact.py` — the secret scrubber. Runs by default in both tools.
 - `Caddyfile.example` — Caddy2 config with `basic_auth`.
 
@@ -86,10 +87,30 @@ Override ad hoc: `--host name=user@target` (repeatable) for machines, and
    (`--jobs`, default 4). Unreachable hosts are reported and skipped, never fatal.
 2. **render** — each transcript → `_site/<host>/<session-id>.html`. Redaction runs here.
    Empty/aborted sessions (zero turns) are dropped.
-3. **index** — `_site/index.html`, grouped project → session → subagents, projects
-   ordered by most recent activity. Live search box, per-machine filter, subagent
-   visibility toggle.
-4. **deploy** — `ssh mkdir -p` then `scp -r` to your web root.
+3. **search** — [Pagefind](https://pagefind.app) builds a full-text index of every
+   rendered page into `_site/pagefind/`. Skipped with a warning if pagefind isn't
+   available; the site works fine without it.
+4. **index** — `_site/index.html`, grouped project → session → subagents, projects
+   ordered by most recent activity. Full-text search box, live list filter,
+   per-machine filter, subagent visibility toggle.
+5. **deploy** — `ssh mkdir -p` then `scp -r` to your web root.
+
+## Full-text search
+
+The index page carries a Pagefind search box that searches *inside* every transcript —
+prose, thinking blocks, and tool output (tool payloads are down-weighted so
+conversation text ranks first). Results come with highlighted excerpts and can be
+narrowed by host, project, and session kind (main vs subagent).
+
+The search index and UI are static files served from `_site/pagefind/` on your own
+origin, so the no-external-requests property still holds. It runs before `index.html`
+is written, so the index page itself never appears in results. Redaction runs before
+indexing, so scrubbed secrets aren't searchable either.
+
+Pagefind is found in this order: a `pagefind` binary on `PATH`, then `npx -y
+pagefind@1` (needs Node). With neither present the step is skipped — nothing breaks,
+you just don't get the search box. Note the search runs client-side over a chunked
+index, so only the chunks a query touches are downloaded.
 
 ## Redaction
 
@@ -239,6 +260,7 @@ Pages set `noindex`, but auth is what actually keeps them private.
 | `--no-deploy` | Build locally into `./_site` |
 | `--no-fetch` | Rebuild from an existing `--staging` dir; no SSH |
 | `--no-thinking` | Omit Claude's thinking blocks |
+| `--no-search` | Skip the pagefind full-text search index |
 | `--skip-subagents` | Don't render subagent runs at all |
 | `--keep-duplicates` | Don't collapse a session found on several hosts |
 | `--explain` | Print each description's provenance, then exit |
@@ -256,6 +278,10 @@ Pages set `noindex`, but auth is what actually keeps them private.
 ## Requirements
 
 Python 3.9+, `ssh`/`scp`, and a web server. No third-party Python packages.
+
+Optional: [pagefind](https://pagefind.app) for full-text search — either the
+standalone binary or Node (it's run via `npx`). Without it the build still succeeds,
+minus the search box.
 
 ## License
 

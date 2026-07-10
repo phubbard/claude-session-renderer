@@ -146,8 +146,9 @@ def render_tool_use(block) -> str:
         if isinstance(tinput, dict) and key in tinput:
             hint = f" · {hl(esc(str(tinput[key])[:80]))}"
             break
+    # Low pagefind weight: tool payloads are searchable but shouldn't outrank prose.
     return (
-        f'<details class="tool">'
+        f'<details class="tool" data-pagefind-weight="0.25">'
         f'<summary><span class="badge tool-badge">tool</span> '
         f'<span class="tool-name">{name}</span>{hint}</summary>'
         f'<pre class="code">{hl(esc(pretty))}</pre>'
@@ -165,7 +166,7 @@ def render_tool_result(block) -> str:
         text = text[:20000]
         truncated = '<div class="truncated">… output truncated …</div>'
     return (
-        f'<details class="tool {cls}">'
+        f'<details class="tool {cls}" data-pagefind-weight="0.25">'
         f'<summary><span class="badge result-badge">{label}</span> output</summary>'
         f'<pre class="code">{hl(esc(text))}</pre>{truncated}'
         f"</details>"
@@ -205,7 +206,7 @@ def render_message(entry, include_thinking=True) -> str:
                 think = b.get("thinking", "") or b.get("text", "")
                 if think.strip():
                     body_parts.append(
-                        f'<details class="thinking"><summary>'
+                        f'<details class="thinking" data-pagefind-weight="0.5"><summary>'
                         f'<span class="badge think-badge">thinking</span></summary>'
                         f'<div class="text muted">{md_lite(think)}</div></details>'
                     )
@@ -226,9 +227,11 @@ def render_message(entry, include_thinking=True) -> str:
     role_label = {"user": "You", "assistant": "Claude"}.get(role, esc(role))
     role_cls = "user" if role == "user" else "assistant"
     ts_html = f'<span class="ts">{esc(ts)}</span>' if ts else ""
+    # turn-head is ignored so "You"/"Claude"/timestamps don't pollute search excerpts.
     return (
         f'<div class="turn {role_cls}">'
-        f'<div class="turn-head"><span class="role">{esc(role_label)}</span>{ts_html}</div>'
+        f'<div class="turn-head" data-pagefind-ignore>'
+        f'<span class="role">{esc(role_label)}</span>{ts_html}</div>'
         f'<div class="turn-body">{"".join(body_parts)}</div>'
         f"</div>"
     )
@@ -532,8 +535,16 @@ def extract_meta(entries, path=None) -> dict:
     }
 
 
+def _pf_val(v) -> str:
+    """Sanitize a value for pagefind's comma-separated attribute lists."""
+    return esc(re.sub(r"[,:]+", " ", str(v)).strip())
+
+
 def build_html(entries, title, source_name, include_thinking=True,
-               redaction_note="", redacted=True) -> str:
+               redaction_note="", redacted=True, search_meta=None) -> str:
+    """search_meta, when given, becomes pagefind filters/sort on the page:
+    {"host": ..., "project": ..., "kind": "session"|"subagent", "date": "YYYY-MM-DD"}.
+    Pages are always tagged data-pagefind-body so a pagefind run can index them."""
     # Pull metadata + a summary if present.
     summary = None
     session_id = None
@@ -577,12 +588,27 @@ def build_html(entries, title, source_name, include_thinking=True,
     generated = _dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
 
     if not redacted:
-        banner = ('<div class="banner warn">⚠ Published <strong>without redaction</strong>. '
-                  'This page may contain credentials.</div>')
+        banner = ('<div class="banner warn" data-pagefind-ignore>⚠ Published '
+                  '<strong>without redaction</strong>. This page may contain credentials.</div>')
     elif redaction_note:
-        banner = f'<div class="banner ok">🛡 {esc(redaction_note)}</div>'
+        banner = f'<div class="banner ok" data-pagefind-ignore>🛡 {esc(redaction_note)}</div>'
     else:
-        banner = '<div class="banner ok">🛡 Redaction ran; no known secret patterns found.</div>'
+        banner = ('<div class="banner ok" data-pagefind-ignore>🛡 Redaction ran; '
+                  'no known secret patterns found.</div>')
+
+    # Pagefind hooks: body scope on .wrap (h1 inside → becomes the result title),
+    # filters/sort/meta as empty spans — pagefind takes ONE declaration per
+    # element, so each gets its own. Inert unless a pagefind run indexes the output.
+    pf_spans = ""
+    if search_meta:
+        for k, v in search_meta.items():
+            if not v or k == "date":
+                continue
+            pf_spans += f'<span data-pagefind-filter="{k}:{_pf_val(v)}"></span>'
+        if search_meta.get("date"):
+            d = esc(search_meta["date"])
+            pf_spans += (f'<span data-pagefind-sort="date:{d}"></span>'
+                         f'<span data-pagefind-meta="date:{d}"></span>')
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -594,16 +620,16 @@ def build_html(entries, title, source_name, include_thinking=True,
 <style>{CSS}</style>
 </head>
 <body>
-<div class="wrap">
+<div class="wrap" data-pagefind-body>{pf_spans}
 <header class="page">
 <h1>{esc(page_title)}</h1>
-<div class="meta">{" · ".join(meta_bits)}</div>
+<div class="meta" data-pagefind-ignore>{" · ".join(meta_bits)}</div>
 </header>
 {banner}
 <main>
 {"".join(turns_html) if turns_html else '<p class="muted">No visible turns in this transcript.</p>'}
 </main>
-<footer class="page">
+<footer class="page" data-pagefind-ignore>
 Rendered from <code>{esc(source_name)}</code> · generated {esc(generated)} · self-contained, no external requests
 </footer>
 </div>
