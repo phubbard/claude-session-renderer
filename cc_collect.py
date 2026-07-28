@@ -62,6 +62,10 @@ except ImportError as _e:
 
 DEFAULT_HOSTS = [("web", "web.example.com"), ("axiom", "axiom.example.com")]
 REMOTE_GLOB = "~/.claude/projects"
+# The Cowork desktop app (local agent mode) keeps a private .claude/projects
+# tree per sandbox under Application Support. Target keyword: "cowork".
+COWORK_ROOT = (Path.home() / "Library" / "Application Support" / "Claude"
+               / "local-agent-mode-sessions")
 # Persistent state: fetch staging (so rsync runs are incremental) and the
 # last-publish stamp that --changed-only compares against.
 STATE_DIR = Path.home() / ".local" / "state" / "cc_collect"
@@ -141,6 +145,10 @@ def clean_dir(d: Path):
 
 def probe_platform(target: str) -> dict:
     """Return {'os':..., 'kernel':..., 'arch':..., 'pretty':...} for a host."""
+    if target == "cowork":
+        plat = probe_platform("local")
+        plat["pretty"] = f"Cowork · {plat['pretty']}"
+        return plat
     if target == "local":
         uname = run(["uname", "-s", "-r", "-m"]).stdout.strip()
         pretty = ""
@@ -181,6 +189,13 @@ def _os_release(text: str) -> str:
 
 def list_transcripts(target: str):
     """Return remote/local paths of all session .jsonl files."""
+    if target == "cowork":
+        if not COWORK_ROOT.exists():
+            return []
+        # Each sandbox has its own .claude/projects; other jsonl in the tree
+        # (audit logs etc.) are not transcripts.
+        return [str(p) for p in COWORK_ROOT.rglob("*.jsonl")
+                if "/.claude/projects/" in str(p)]
     if target == "local":
         base = Path.home() / ".claude" / "projects"
         if not base.exists():
@@ -209,7 +224,7 @@ def fetch_host(name: str, target: str, staging: Path, verbose=True):
         return plat, []
 
     local_files = []
-    if target == "local":
+    if target in ("local", "cowork"):
         for src in remote_files:
             out = dest / Path(src).name
             shutil.copy2(src, out)
@@ -251,8 +266,8 @@ def fetch_host(name: str, target: str, staging: Path, verbose=True):
 # --------------------------------------------------------------------------- #
 def _any_modified_within(target: str, minutes: int) -> bool:
     """True if any transcript on `target` changed in the last `minutes` minutes."""
-    if target == "local":
-        base = Path.home() / ".claude" / "projects"
+    if target in ("local", "cowork"):
+        base = COWORK_ROOT if target == "cowork" else Path.home() / ".claude" / "projects"
         if not base.exists():
             return False
         r = run(["find", str(base), "-name", "*.jsonl", "-mmin", f"-{int(minutes)}"])
@@ -602,6 +617,7 @@ font-size:12px;color:var(--muted);padding:5px 0;}
 letter-spacing:.02em;color:#fff;}
 .host-web{background:#2f6f9f;}.host-axiom{background:#7a4f9c;}
 .host-laptop{background:#4a7c59;}.host-other{background:#7a7a72;}
+.host-cowork{background:#c15f3c;}
 .agent-badge{background:transparent;border:1px solid var(--agent);color:var(--agent);}
 .redact-badge{background:transparent;border:1px solid #b3453a;color:#b3453a;}
 .link-inferred{border:1px dashed var(--muted);color:var(--muted);background:transparent;}
@@ -630,7 +646,7 @@ border-top:1px solid var(--line);padding-top:16px;}
 
 
 def _host_cls(host):
-    return f"host-{host}" if host in ("web", "axiom", "laptop") else "host-other"
+    return f"host-{host}" if host in ("web", "axiom", "laptop", "cowork") else "host-other"
 
 
 def _facts(r, compact=False):
@@ -1055,7 +1071,9 @@ def main(argv=None):
         print(f"\n[1/5] fetch — probing {len(hosts)} hosts over SSH")
         if args.dry_run:
             for name, target in hosts:
-                if target == "local":
+                if target == "cowork":
+                    print(f"  [{name}] would scan {COWORK_ROOT} (Cowork, local)")
+                elif target == "local":
                     print(f"  [{name}] would scan {Path.home() / '.claude' / 'projects'} (local)")
                 else:
                     print(f"  [{name}] would ssh {target}, then "

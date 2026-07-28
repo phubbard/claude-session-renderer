@@ -28,6 +28,12 @@ Claude Code writes one JSONL file per session:
 ~/.claude/projects/<slugified-project-path>/<session-id>.jsonl
 ```
 
+The Cowork desktop app (local agent mode) keeps a separate `.claude/projects`
+tree per sandbox under
+`~/Library/Application Support/Claude/local-agent-mode-sessions/`. Add a
+machine line with the reserved target `cowork` to collect those too — Cowork
+projects show up with their sandbox names (`/sessions/cool-nice-maxwell`).
+
 You rarely need to know this — the tools find them.
 
 ## Quick start
@@ -60,6 +66,7 @@ All configuration lives here — the machines to collect from, and where to publ
 web       you@web.example.com
 axiom     you@axiom.example.com
 laptop    local
+cowork    cowork            # Cowork desktop app sessions on this Mac
 
 # where to publish the built site
 deploy    web.example.com:sessions
