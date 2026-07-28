@@ -49,7 +49,7 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
+import time
 from pathlib import Path
 
 # Reuse the renderer/parsers from publish_session.py (must sit alongside this file).
@@ -62,6 +62,9 @@ except ImportError as _e:
 
 DEFAULT_HOSTS = [("web", "web.example.com"), ("axiom", "axiom.example.com")]
 REMOTE_GLOB = "~/.claude/projects"
+# Persistent state: fetch staging (so rsync runs are incremental) and the
+# last-publish stamp that --changed-only compares against.
+STATE_DIR = Path.home() / ".local" / "state" / "cc_collect"
 SSH_OPTS = [
     "-o", "BatchMode=yes",
     "-o", "ConnectTimeout=10",
@@ -212,20 +215,64 @@ def fetch_host(name: str, target: str, staging: Path, verbose=True):
             shutil.copy2(src, out)
             local_files.append(out)
     else:
-        # One scp invocation with many sources is far faster than N invocations.
-        # Flatten into dest/; session ids are unique so collisions are unlikely.
-        quoted = " ".join(shlex.quote(f) for f in remote_files)
-        # scp needs the remote paths as a single remote spec list
-        specs = [f"{target}:{shlex.quote(f)}" for f in remote_files]
-        r = run(["scp", *SSH_OPTS, "-q", *specs, str(dest)])
-        if r.returncode != 0:
-            print(f"  [{name}] scp failed: {r.stderr.strip()[:200]}", file=sys.stderr)
-            return plat, []
-        local_files = sorted(dest.glob("*.jsonl"))
+        fetched = False
+        if shutil.which("rsync"):
+            # Incremental: only changed transcripts cross the wire, and --delete
+            # keeps staging a mirror so remotely-removed sessions drop out too.
+            # (_platform.json in dest is excluded from the transfer rules, which
+            # protects it from --delete.)
+            r = run(["rsync", "-az", "--delete", "--prune-empty-dirs",
+                     "--include=*/", "--include=*.jsonl", "--exclude=*",
+                     "-e", "ssh " + " ".join(SSH_OPTS),
+                     f"{target}:.claude/projects/", f"{dest}/"])
+            if r.returncode == 0:
+                fetched = True
+            else:
+                print(f"  [{name}] rsync failed ({r.stderr.strip()[:150]}); "
+                      f"falling back to scp", file=sys.stderr)
+        if not fetched:
+            # One scp invocation with many sources is far faster than N invocations.
+            # Flatten into dest/; session ids are unique so collisions are unlikely.
+            specs = [f"{target}:{shlex.quote(f)}" for f in remote_files]
+            r = run(["scp", *SSH_OPTS, "-q", *specs, str(dest)])
+            if r.returncode != 0:
+                print(f"  [{name}] scp failed: {r.stderr.strip()[:200]}", file=sys.stderr)
+                return plat, []
+        # rglob: rsync preserves the project tree, scp flattens — accept both.
+        local_files = sorted(dest.rglob("*.jsonl"))
 
     if verbose:
         print(f"  [{name}] {plat['pretty']} ({plat['arch']}) — {len(local_files)} sessions")
     return plat, list(local_files)
+
+
+# --------------------------------------------------------------------------- #
+# Gating: skip the whole run when there's nothing new / Claude is mid-session
+# --------------------------------------------------------------------------- #
+def _any_modified_within(target: str, minutes: int) -> bool:
+    """True if any transcript on `target` changed in the last `minutes` minutes."""
+    if target == "local":
+        base = Path.home() / ".claude" / "projects"
+        if not base.exists():
+            return False
+        r = run(["find", str(base), "-name", "*.jsonl", "-mmin", f"-{int(minutes)}"])
+    else:
+        r = run(["ssh", *SSH_OPTS, target,
+                 f"find {REMOTE_GLOB} -name '*.jsonl' -mmin -{int(minutes)} "
+                 f"2>/dev/null | head -1"])
+        # An unreachable host reports no activity/changes; it shouldn't block a
+        # skip, and fetch will report it properly if the run does proceed.
+    return bool(r.stdout.strip())
+
+
+def probe_host_activity(target: str, idle_min: int, since_min) -> tuple:
+    """Cheap pre-flight for one host: (active_recently, changed_since_stamp).
+
+    since_min=None means no previous publish exists — everything counts as new.
+    """
+    active = _any_modified_within(target, idle_min) if idle_min else False
+    changed = True if since_min is None else _any_modified_within(target, since_min)
+    return active, changed
 
 
 # --------------------------------------------------------------------------- #
@@ -427,6 +474,15 @@ def link_subagents(records, uuid_index):
 
         pid = uuid_index.get((r["host"], r.get("parent_uuid")))
         if pid and pid != r["session_id"] and pid in by_id:
+            r["parent_id"] = pid
+            r["link"] = "exact"
+            exact += 1
+            continue
+
+        # agent-*.jsonl files embed the spawning session's id directly.
+        pid = r.get("parent_session_id")
+        if pid and pid != r["session_id"] and pid in by_id \
+                and by_id[pid]["host"] == r["host"]:
             r["parent_id"] = pid
             r["link"] = "exact"
             exact += 1
@@ -847,20 +903,39 @@ generated {esc(generated)}</div>
 # Step 4: deploy
 # --------------------------------------------------------------------------- #
 def deploy(site: Path, target: str, dry_run=False):
-    """scp the built tree to e.g. web.example.com:sessions/"""
+    """Sync the built tree to e.g. web.example.com:sessions/.
+
+    Prefers rsync: --checksum skips the (many) pages whose bytes didn't change,
+    --delete drops remotely-stale pages. Falls back to a full scp -r when rsync
+    is missing on either end.
+    """
     host, _, remote_path = target.partition(":")
     remote_path = remote_path or "sessions"
     mk = ["ssh", *SSH_OPTS, host, f"mkdir -p {shlex.quote(remote_path)}"]
+    rs = ["rsync", "-az", "--checksum", "--delete",
+          "-e", "ssh " + " ".join(SSH_OPTS),
+          f"{site}/", f"{host}:{remote_path}/"]
     cp = ["scp", *SSH_OPTS, "-q", "-r", *[str(p) for p in site.iterdir()],
           f"{host}:{shlex.quote(remote_path)}/"]
+    use_rsync = bool(shutil.which("rsync"))
     if dry_run:
         print("  would run:", " ".join(mk))
-        print("  would run:", " ".join(cp[:6]), f"... ({len(list(site.iterdir()))} items)")
+        if use_rsync:
+            print("  would run:", " ".join(rs))
+        else:
+            print("  would run:", " ".join(cp[:6]), f"... ({len(list(site.iterdir()))} items)")
         return True
     r = run(mk)
     if r.returncode != 0:
         print(f"  mkdir failed: {r.stderr.strip()[:200]}", file=sys.stderr)
         return False
+    if use_rsync:
+        r = run(rs)
+        if r.returncode == 0:
+            print(f"  deployed to {host}:{remote_path}/ (rsync, unchanged pages skipped)")
+            return True
+        print(f"  rsync failed ({r.stderr.strip()[:150]}); falling back to scp",
+              file=sys.stderr)
     r = run(cp)
     if r.returncode != 0:
         print(f"  scp failed: {r.stderr.strip()[:300]}", file=sys.stderr)
@@ -880,7 +955,8 @@ def main(argv=None):
                     metavar="NAME=TARGET", help="Add/override a host (repeatable)")
     ap.add_argument("--site", type=Path, default=Path("_site"), help="Local build dir")
     ap.add_argument("--staging", type=Path, default=None,
-                    help="Where fetched .jsonl land (default: temp dir)")
+                    help=f"Where fetched .jsonl land (default: {STATE_DIR / 'staging'}; "
+                         "persistent, so rsync fetches are incremental)")
     ap.add_argument("--deploy-to", default=None,
                     help="scp destination, overriding the 'deploy' line in hosts.conf")
     ap.add_argument("--no-fetch", action="store_true",
@@ -898,6 +974,12 @@ def main(argv=None):
                     help="DANGEROUS: publish raw transcripts without scrubbing credentials")
     ap.add_argument("--no-search", action="store_true",
                     help="Skip the pagefind full-text search index")
+    ap.add_argument("--changed-only", action="store_true",
+                    help="Exit early unless some transcript changed since the last "
+                         "successful deploy (cheap SSH probe per host)")
+    ap.add_argument("--idle-min", type=int, default=0, metavar="N",
+                    help="Exit early if any transcript changed in the last N minutes "
+                         "(i.e. Claude is likely still mid-session)")
     ap.add_argument("--jobs", type=int, default=4, help="Parallel host fetches")
     args = ap.parse_args(argv)
 
@@ -930,7 +1012,26 @@ def main(argv=None):
             "  or pass --deploy-to HOST:PATH, or build locally with --no-deploy."
         )
 
-    staging = args.staging or Path(tempfile.mkdtemp(prefix="cc-staging-"))
+    # ---- 0. gate (optional): is there anything to do, and is now a good time?
+    stamp = STATE_DIR / "last_publish"
+    if args.changed_only or args.idle_min:
+        since_min = None
+        if stamp.exists():
+            since_min = max(1, int((time.time() - stamp.stat().st_mtime) / 60))
+        with cf.ThreadPoolExecutor(max_workers=max(len(hosts), 1)) as ex:
+            probes = list(ex.map(
+                lambda h: probe_host_activity(h[1], args.idle_min, since_min), hosts))
+        if args.changed_only and not any(c for _, c in probes):
+            print(f"gate: nothing changed since last publish "
+                  f"({since_min} min ago); nothing to do")
+            return 0
+        if args.idle_min and any(a for a, _ in probes):
+            print(f"gate: a transcript changed within the last {args.idle_min} min — "
+                  f"Claude looks active, try again later")
+            return 0
+        print("gate: new activity found and all hosts idle — proceeding")
+
+    staging = args.staging or (STATE_DIR / "staging")
     staging.mkdir(parents=True, exist_ok=True)
     site = args.site
 
@@ -944,7 +1045,7 @@ def main(argv=None):
         print("\n[1/5] fetch — skipped (--no-fetch), reading staging dir")
         for name, target in hosts:
             d = staging / name
-            paths = sorted(d.glob("*.jsonl")) if d.exists() else []
+            paths = sorted(d.rglob("*.jsonl")) if d.exists() else []
             plat_file = d / "_platform.json"
             plat = json.loads(plat_file.read_text()) if plat_file.exists() \
                 else {"pretty": "unknown", "os": "?", "arch": ""}
@@ -958,7 +1059,7 @@ def main(argv=None):
                     print(f"  [{name}] would scan {Path.home() / '.claude' / 'projects'} (local)")
                 else:
                     print(f"  [{name}] would ssh {target}, then "
-                          f"scp {target}:{REMOTE_GLOB}/**/*.jsonl")
+                          f"rsync/scp {target}:{REMOTE_GLOB}/**/*.jsonl")
             if args.no_deploy:
                 tail = "skip deploy"
             elif deploy_target:
@@ -1059,6 +1160,10 @@ def main(argv=None):
         ok = deploy(site, deploy_target, dry_run=args.dry_run)
         if not ok:
             return 1
+        if not args.dry_run:
+            # Stamp for --changed-only: next gated run compares against this.
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            (STATE_DIR / "last_publish").touch()
 
     print("\nDone.")
     return 0

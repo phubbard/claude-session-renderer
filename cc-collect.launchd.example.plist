@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS LaunchAgent for cc_collect.py.
+
+  Polls every 30 minutes between 20:00 and 23:30. Each poll is a few seconds
+  of SSH probing unless there is genuinely new work: the gating flags make
+  cc_collect exit immediately unless (a) some transcript changed since the
+  last successful publish AND (b) no transcript changed in the last 60
+  minutes (i.e. Claude has gone quiet).
+
+  Install:
+      cp cc-collect.launchd.example.plist \
+         ~/Library/LaunchAgents/com.example.cc-collect.plist
+      # edit the paths below, then:
+      launchctl bootstrap gui/$(id -u) \
+         ~/Library/LaunchAgents/com.example.cc-collect.plist
+
+  Remove:
+      launchctl bootout gui/$(id -u)/com.example.cc-collect
+
+  Why launchd and not cron: LaunchAgents run inside your login session, so
+  ssh can reach the launchd-provided ssh-agent and keychain-stored key
+  passphrases (add keys with `ssh-add --apple-use-keychain`). Cron gets
+  neither. launchd also refuses to start a second copy while one is running.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.cc-collect</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/python3</string>
+    <string>cc_collect.py</string>
+    <string>--changed-only</string>
+    <string>--idle-min</string>
+    <string>60</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/you/code/claude-session-renderer</string>
+
+  <!-- npx (for pagefind) and rsync must be findable -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/you/.local/state/cc_collect/launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/you/.local/state/cc_collect/launchd.log</string>
+
+  <!-- every 30 min, 20:00–23:30 -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Hour</key><integer>21</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Hour</key><integer>21</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Hour</key><integer>22</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Hour</key><integer>22</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Hour</key><integer>23</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Hour</key><integer>23</integer><key>Minute</key><integer>30</integer></dict>
+  </array>
+</dict>
+</plist>

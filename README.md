@@ -82,8 +82,10 @@ Override ad hoc: `--host name=user@target` (repeatable) for machines, and
 
 ## What the pipeline does
 
-1. **fetch** — per host, probe platform (`uname`, `/etc/os-release`, `sw_vers`), find
-   `~/.claude/projects/**/*.jsonl`, `scp` them into staging. Hosts run in parallel
+1. **fetch** — per host, probe platform (`uname`, `/etc/os-release`, `sw_vers`), then
+   `rsync` `~/.claude/projects/**/*.jsonl` into a persistent staging dir
+   (`~/.local/state/cc_collect/staging`), so only new/changed transcripts cross the
+   wire; falls back to a full `scp` where rsync is missing. Hosts run in parallel
    (`--jobs`, default 4). Unreachable hosts are reported and skipped, never fatal.
 2. **render** — each transcript → `_site/<host>/<session-id>.html`. Redaction runs here.
    Empty/aborted sessions (zero turns) are dropped.
@@ -93,7 +95,9 @@ Override ad hoc: `--host name=user@target` (repeatable) for machines, and
 4. **index** — `_site/index.html`, grouped project → session → subagents, projects
    ordered by most recent activity. Full-text search box, live list filter,
    per-machine filter, subagent visibility toggle.
-5. **deploy** — `ssh mkdir -p` then `scp -r` to your web root.
+5. **deploy** — `rsync --checksum --delete` to your web root (rendered pages are
+   byte-stable for unchanged inputs, so unchanged pages aren't re-sent); `scp -r`
+   fallback.
 
 ## Full-text search
 
@@ -261,18 +265,51 @@ Pages set `noindex`, but auth is what actually keeps them private.
 | `--no-fetch` | Rebuild from an existing `--staging` dir; no SSH |
 | `--no-thinking` | Omit Claude's thinking blocks |
 | `--no-search` | Skip the pagefind full-text search index |
+| `--changed-only` | Exit early unless a transcript changed since the last deploy |
+| `--idle-min N` | Exit early if any transcript changed in the last N minutes |
 | `--skip-subagents` | Don't render subagent runs at all |
 | `--keep-duplicates` | Don't collapse a session found on several hosts |
 | `--explain` | Print each description's provenance, then exit |
 | `--no-redact` | Publish raw. Warns loudly. Don't. |
-| `--staging DIR` | Keep fetched JSONL around |
+| `--staging DIR` | Staging dir override (default `~/.local/state/cc_collect/staging`) |
 | `--deploy-to H:P` | scp destination; overrides the `deploy` line in `hosts.conf` |
 | `--jobs N` | Parallel host fetches |
 
 ## Scheduling
 
+The gating flags make automation cheap: poll aggressively, and let the tool decide
+whether a run is worth it.
+
+```bash
+python3 cc_collect.py --changed-only --idle-min 60
+```
+
+exits within a few seconds unless **both** hold: some transcript changed since the
+last successful deploy (`--changed-only`, tracked via a stamp file in
+`~/.local/state/cc_collect/`), and no transcript changed in the last hour
+(`--idle-min 60` — i.e. Claude has gone quiet, so you're not publishing
+mid-session). Each gate costs one cheap `find` over SSH per host.
+
+Runs that do proceed are incremental end to end: rsync fetches only new
+transcripts into the persistent staging dir, and rsync deploys only changed pages.
+
+**macOS:** use the LaunchAgent — see `cc-collect.launchd.example.plist`, which polls
+every 30 minutes from 20:00 to 23:30. Prefer launchd over cron here: agents run in
+your login session, so SSH reaches the launchd ssh-agent and keychain-stored key
+passphrases (add keys with `ssh-add --apple-use-keychain`); launchd also won't start
+a second copy while one is still running.
+
+```bash
+cp cc-collect.launchd.example.plist ~/Library/LaunchAgents/com.example.cc-collect.plist
+# edit paths, then:
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.cc-collect.plist
+launchctl kickstart gui/$(id -u)/com.example.cc-collect   # trial run now
+```
+
+**Linux:** plain cron works, same idea:
+
 ```cron
-30 2 * * * cd /home/you/claude-session-renderer && /usr/bin/python3 cc_collect.py >> publish.log 2>&1
+*/30 20-23 * * * cd /home/you/claude-session-renderer && /usr/bin/python3 cc_collect.py --changed-only --idle-min 60 >> publish.log 2>&1
 ```
 
 ## Requirements
@@ -281,7 +318,8 @@ Python 3.9+, `ssh`/`scp`, and a web server. No third-party Python packages.
 
 Optional: [pagefind](https://pagefind.app) for full-text search — either the
 standalone binary or Node (it's run via `npx`). Without it the build still succeeds,
-minus the search box.
+minus the search box. `rsync` on both ends makes fetch and deploy incremental
+(macOS's bundled openrsync works); without it everything falls back to `scp`.
 
 ## License
 

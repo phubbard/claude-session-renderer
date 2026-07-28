@@ -509,8 +509,20 @@ def extract_meta(entries, path=None) -> dict:
                     tool_calls += 1
 
     kind = session_kind(entries)
-    # Trust the transcript's own sessionId over the filename.
-    sid = own_session_id(entries) or session_id or (path.stem if path else "unknown")
+    embedded = own_session_id(entries) or session_id or ""
+    stem = path.stem if path else ""
+    # Trust the transcript's own sessionId over the filename -- EXCEPT for
+    # subagent files. Newer Claude Code writes each subagent to its own
+    # agent-*.jsonl whose entries carry the SPAWNING session's sessionId; there
+    # the filename is the only unique identity (otherwise every subagent of a
+    # session collides with it and with each other), and the embedded id is an
+    # authoritative parent link.
+    if kind["is_subagent"] and stem and embedded and stem != embedded:
+        sid = stem
+        parent_sid = embedded
+    else:
+        sid = embedded or stem or "unknown"
+        parent_sid = ""
     desc, desc_src = _infer_description(entries)
     if not desc:
         # Never emit a bare "(no description)" -- say something useful.
@@ -519,6 +531,7 @@ def extract_meta(entries, path=None) -> dict:
 
     return {
         "session_id": sid,
+        "parent_session_id": parent_sid,
         "description_source": desc_src,
         "foreign_sessions": sorted(foreign_session_ids(entries)),
         "cwd": cwd or "",
@@ -585,7 +598,9 @@ def build_html(entries, title, source_name, include_thinking=True,
     meta_bits.append(f"<span>{turn_count} turns</span>")
     if version:
         meta_bits.append(f"<span>cc v{esc(version)}</span>")
-    generated = _dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
+    # No wall-clock "generated" stamp: identical input must yield identical
+    # bytes, so an rsync deploy can skip pages that didn't change.
+    ended = f" · session ended {esc(_fmt_ts(last_ts))}" if last_ts else ""
 
     if not redacted:
         banner = ('<div class="banner warn" data-pagefind-ignore>⚠ Published '
@@ -630,7 +645,7 @@ def build_html(entries, title, source_name, include_thinking=True,
 {"".join(turns_html) if turns_html else '<p class="muted">No visible turns in this transcript.</p>'}
 </main>
 <footer class="page" data-pagefind-ignore>
-Rendered from <code>{esc(source_name)}</code> · generated {esc(generated)} · self-contained, no external requests
+Rendered from <code>{esc(source_name)}</code>{ended} · self-contained, no external requests
 </footer>
 </div>
 </body>
