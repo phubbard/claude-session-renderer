@@ -36,6 +36,32 @@ projects show up with their sandbox names (`/sessions/cool-nice-maxwell`).
 
 You rarely need to know this — the tools find them.
 
+## Chat conversations (claude.ai export)
+
+claude.ai **chat** sessions — including chats in the desktop app — never write a
+transcript to disk, even when they edit local files; the conversation lives only
+in your claude.ai account. The one way in is the account data export
+(claude.ai → Settings → Privacy → Export data), which arrives as a
+`data-...-batch-0000.zip` holding `conversations.json`.
+
+`chat_export.py` converts that export into transcripts this renderer
+understands (text, thinking, tool calls, attachment text — all through the same
+redaction). Use it standalone:
+
+```bash
+python3 chat_export.py                # newest export in ~/Downloads → ./chat-transcripts/
+python3 chat_export.py export.zip -o outdir
+```
+
+or add the reserved target `chats` to `hosts.conf` and `cc_collect.py` will
+convert the newest export it finds in `~/Downloads` or
+`~/.local/state/cc_collect/chat-exports/` on every run, grouped under a
+`claude.ai` project with their own badge. Conversations deleted from your
+account disappear from the site at the next conversion (the converter mirrors
+the export). The export is a manual download, so refresh it whenever you want
+newer chats on the site; with `--changed-only`, dropping a new export in is
+itself enough to make the next scheduled run publish.
+
 ## Quick start
 
 Publish a single session:

@@ -57,18 +57,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:
     from publish_session import load_jsonl, build_html, extract_meta, esc, _fmt_ts
     from redact import redact_entries, summarize
+    from chat_export import find_export as find_chat_export, convert_export
 except ImportError as _e:
-    sys.exit(f"error: publish_session.py and redact.py must sit beside cc_collect.py ({_e})")
+    sys.exit(f"error: publish_session.py, redact.py and chat_export.py must sit "
+             f"beside cc_collect.py ({_e})")
 
 DEFAULT_HOSTS = [("web", "web.example.com"), ("axiom", "axiom.example.com")]
 REMOTE_GLOB = "~/.claude/projects"
+# Persistent state: fetch staging (so rsync runs are incremental) and the
+# last-publish stamp that --changed-only compares against.
+STATE_DIR = Path.home() / ".local" / "state" / "cc_collect"
 # The Cowork desktop app (local agent mode) keeps a private .claude/projects
 # tree per sandbox under Application Support. Target keyword: "cowork".
 COWORK_ROOT = (Path.home() / "Library" / "Application Support" / "Claude"
                / "local-agent-mode-sessions")
-# Persistent state: fetch staging (so rsync runs are incremental) and the
-# last-publish stamp that --changed-only compares against.
-STATE_DIR = Path.home() / ".local" / "state" / "cc_collect"
+# claude.ai CHAT conversations never touch disk; the account data export is
+# the only way in. Target keyword: "chats" — converts the newest export found
+# in these directories (see chat_export.py).
+CHAT_EXPORT_DIRS = [STATE_DIR / "chat-exports", Path.home() / "Downloads"]
 SSH_OPTS = [
     "-o", "BatchMode=yes",
     "-o", "ConnectTimeout=10",
@@ -145,6 +151,9 @@ def clean_dir(d: Path):
 
 def probe_platform(target: str) -> dict:
     """Return {'os':..., 'kernel':..., 'arch':..., 'pretty':...} for a host."""
+    if target == "chats":
+        # Not a machine: conversations converted from a claude.ai data export.
+        return {"os": "chat", "kernel": "", "arch": "", "pretty": "claude.ai chats"}
     if target == "cowork":
         plat = probe_platform("local")
         plat["pretty"] = f"Cowork · {plat['pretty']}"
@@ -214,6 +223,19 @@ def fetch_host(name: str, target: str, staging: Path, verbose=True):
     dest.mkdir(parents=True, exist_ok=True)
 
     plat = probe_platform(target)
+    if target == "chats":
+        src = find_chat_export(CHAT_EXPORT_DIRS)
+        if not src:
+            print(f"  [{name}] no claude.ai export found "
+                  f"(looked in {', '.join(str(d) for d in CHAT_EXPORT_DIRS)}); "
+                  f"download one via claude.ai Settings → Privacy → Export data")
+            # Keep previously converted chats rather than dropping them.
+            return plat, sorted(dest.glob("chat-*.jsonl"))
+        written, skipped = convert_export(src, dest)
+        if verbose:
+            print(f"  [{name}] {plat['pretty']} — {written} conversations "
+                  f"from {src.name}")
+        return plat, sorted(dest.glob("chat-*.jsonl"))
     if plat.get("pretty") == "unreachable":
         print(f"  [{name}] UNREACHABLE: {plat.get('error','')}", file=sys.stderr)
         # Fall back to what the last successful fetch left in staging, so a
@@ -277,6 +299,9 @@ def fetch_host(name: str, target: str, staging: Path, verbose=True):
 # --------------------------------------------------------------------------- #
 def _any_modified_within(target: str, minutes: int) -> bool:
     """True if any transcript on `target` changed in the last `minutes` minutes."""
+    if target == "chats":
+        src = find_chat_export(CHAT_EXPORT_DIRS)
+        return bool(src) and (time.time() - src.stat().st_mtime) / 60 < minutes
     if target in ("local", "cowork"):
         base = COWORK_ROOT if target == "cowork" else Path.home() / ".claude" / "projects"
         if not base.exists():
@@ -296,7 +321,10 @@ def probe_host_activity(target: str, idle_min: int, since_min) -> tuple:
 
     since_min=None means no previous publish exists — everything counts as new.
     """
-    active = _any_modified_within(target, idle_min) if idle_min else False
+    # A freshly downloaded export is new work, not "Claude mid-session" —
+    # it never holds up the idle gate.
+    active = _any_modified_within(target, idle_min) \
+        if (idle_min and target != "chats") else False
     changed = True if since_min is None else _any_modified_within(target, since_min)
     return active, changed
 
@@ -628,7 +656,8 @@ font-size:12px;color:var(--muted);padding:5px 0;}
 letter-spacing:.02em;color:#fff;}
 .host-web{background:#2f6f9f;}.host-axiom{background:#7a4f9c;}
 .host-laptop{background:#4a7c59;}.host-other{background:#7a7a72;}
-.host-cowork{background:#c15f3c;}
+.host-cowork{background:#c15f3c;}.host-chats{background:#2f8f8f;}
+.os-chat{border:1px solid #2f8f8f;color:#2f8f8f;background:transparent;}
 .agent-badge{background:transparent;border:1px solid var(--agent);color:var(--agent);}
 .redact-badge{background:transparent;border:1px solid #b3453a;color:#b3453a;}
 .link-inferred{border:1px dashed var(--muted);color:var(--muted);background:transparent;}
@@ -657,7 +686,8 @@ border-top:1px solid var(--line);padding-top:16px;}
 
 
 def _host_cls(host):
-    return f"host-{host}" if host in ("web", "axiom", "laptop", "cowork") else "host-other"
+    return f"host-{host}" if host in ("web", "axiom", "laptop", "cowork", "chats") \
+        else "host-other"
 
 
 def _facts(r, compact=False):
@@ -1082,7 +1112,11 @@ def main(argv=None):
         print(f"\n[1/5] fetch — probing {len(hosts)} hosts over SSH")
         if args.dry_run:
             for name, target in hosts:
-                if target == "cowork":
+                if target == "chats":
+                    src = find_chat_export(CHAT_EXPORT_DIRS)
+                    print(f"  [{name}] would convert "
+                          f"{src if src else 'claude.ai export (NONE FOUND)'}")
+                elif target == "cowork":
                     print(f"  [{name}] would scan {COWORK_ROOT} (Cowork, local)")
                 elif target == "local":
                     print(f"  [{name}] would scan {Path.home() / '.claude' / 'projects'} (local)")

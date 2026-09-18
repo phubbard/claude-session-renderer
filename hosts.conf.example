@@ -5,12 +5,16 @@
 #
 #   <name>    <ssh-target>      ("local" = the machine running the script;
 #                                "cowork" = the Cowork desktop app's sandboxed
-#                                sessions on this Mac)
+#                                sessions on this Mac;
+#                                "chats" = claude.ai chat conversations, from
+#                                the newest account data export found in
+#                                ~/Downloads or ~/.local/state/cc_collect/chat-exports)
 
 web       you@web.example.com
 axiom     you@axiom.example.com
 laptop    local
 cowork    cowork
+chats     chats
 
 # Where to publish the built site. "deploy" is a reserved first word, so no
 # machine may be named "deploy". At most one deploy line.
