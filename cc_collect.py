@@ -216,6 +216,17 @@ def fetch_host(name: str, target: str, staging: Path, verbose=True):
     plat = probe_platform(target)
     if plat.get("pretty") == "unreachable":
         print(f"  [{name}] UNREACHABLE: {plat.get('error','')}", file=sys.stderr)
+        # Fall back to what the last successful fetch left in staging, so a
+        # host being down doesn't drop its sessions from the published site
+        # (the rsync --delete deploy would remove their pages).
+        staged = sorted(dest.rglob("*.jsonl"))
+        if staged:
+            plat_file = dest / "_platform.json"
+            if plat_file.exists():
+                plat = json.loads(plat_file.read_text())
+            print(f"  [{name}] using {len(staged)} staged transcript(s) "
+                  f"from the last successful fetch")
+            return plat, staged
         return plat, []
 
     remote_files = list_transcripts(target)
